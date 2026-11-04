@@ -84,9 +84,9 @@ if (-not $SkipReport) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File .\report\build.ps1
     if ($LASTEXITCODE -ne 0) { throw 'report build failed' }
     Step 'report numbers'     @('-m','cs5494.checks','report')
-    Copy-Item report\main.pdf submission\60777841.pdf -Force
-    Write-Host '    copied report/main.pdf -> submission/60777841.pdf' -ForegroundColor Yellow
+    Copy-Item report\main.pdf submission\60777841_61083251_60369937.pdf -Force
+    Write-Host '    copied report/main.pdf -> submission/60777841_61083251_60369937.pdf' -ForegroundColor Yellow
 }
 
 Write-Host ''
-Write-Host 'Done. See submission/60777841.pdf and report/figures/.' -ForegroundColor Green
+Write-Host 'Done. See submission/60777841_61083251_60369937.pdf and report/figures/.' -ForegroundColor Green

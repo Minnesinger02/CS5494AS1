@@ -3,7 +3,7 @@
 **Repository:** <https://github.com/Minnesinger02/CS5494AS1> (code, data, checkpoints, report)
 
 All experiments live in one sequence under `results/`. Code is a small package, `cs5494/`,
-with one module per job. The final report is `submission/60777841.pdf`,
+with one module per job. The final report is `submission/60777841_61083251_60369937.pdf`,
 built from `report/main.tex`.
 
 ## Quick start

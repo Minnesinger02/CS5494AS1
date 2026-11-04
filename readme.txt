@@ -2,10 +2,11 @@ CS5494 Topics in Generative AI -- Assignment
 Autoregressive and adversarial generative models for MNIST
 ================================================================================
 
-Student : LIU Naduo (刘纳多)
-Student ID : 60777841
+Members : LIU Naduo (刘纳多) 60777841
+          CUI Zhaonan (崔兆楠) 61083251
+          WANG Siming (王偲铭) 60369937
 Repository : https://github.com/Minnesinger02/CS5494AS1
-Report : submission/60777841.pdf   (16 pages, in this folder)
+Report : submission/60777841_61083251_60369937.pdf   (16 pages, in this folder)
 
 This file is the plain-text "how to run the code" readme required by the assignment.
 The same instructions, with more detail, are in README.md and REPRODUCE.md, and in

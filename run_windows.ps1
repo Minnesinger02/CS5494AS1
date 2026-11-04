@@ -119,7 +119,7 @@ if (Test-Path 'report/build.ps1') {
     & powershell -NoProfile -ExecutionPolicy Bypass -File .\report\build.ps1
     if ($LASTEXITCODE -ne 0) { throw 'report build failed' }
     Invoke-Step 'report number check' 'logs\check_numbers.log' @('-m','cs5494.checks','report')
-    Copy-Item report\main.pdf submission\60777841.pdf -Force
+    Copy-Item report\main.pdf submission\60777841_61083251_60369937.pdf -Force
 }
 
 $info = @"

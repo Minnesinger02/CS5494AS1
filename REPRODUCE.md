@@ -7,7 +7,7 @@
 
 | 想看 | 打开 |
 |---|---|
-| 最终报告（16 页） | `submission/60777841.pdf` |
+| 最终报告（16 页） | `submission/60777841_61083251_60369937.pdf` |
 | 报告源码 | `report/main.tex`、`report/refs.bib` |
 | 五个模型的样本（按数字分列） | `report/figures/digits_*.png` |
 | 三模型并排对照 | `comparisons/digit_grid_comparison.png` |
@@ -144,10 +144,10 @@ cd ..
 **`xelatex: not found`**：只影响重建报告，把 `D:\texlive\2026\bin\windows` 换成自己的路径，
 或直接用 `submission/` 里已编译的 PDF。
 
-**`报告里的姓名/学号`**：已填写（刘纳多 LIU Naduo，60777841），标题页同时给出代码与数据的
-GitHub 链接 <https://github.com/Minnesinger02/CS5494AS1>；提交件按学号命名为
-`submission/60777841.pdf`。若组员后续补充，需要重编译报告并按
-`学号_学号_学号.pdf` 重新命名。
+**`报告里的姓名/学号`**：已填写三人小组（刘纳多 60777841、崔兆楠 61083251、王偲铭 60369937），
+标题页同时给出代码与数据的 GitHub 链接 <https://github.com/Minnesinger02/CS5494AS1>；
+提交件按学号命名为 `submission/60777841_61083251_60369937.pdf`。组员如有变动，需要重编译报告并
+按 `学号_学号_学号.pdf` 重新命名。
 
 **`No module named cs5494`**：请从仓库根目录运行（`python -m cs5494.xxx` 需要根目录在搜索路径上，
 在根目录执行即满足）。
