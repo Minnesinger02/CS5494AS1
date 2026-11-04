@@ -1,0 +1,9 @@
+{
+  "made": {
+    "training_and_preview_seconds": 46.23337409994565,
+    "inference_100_seconds": 0.08684300002641976,
+    "training_samples": 60000,
+    "test_nll_nats_per_image": 68.486085546875,
+    "test_bits_per_pixel": 0.1260261938627218
+  }
+}

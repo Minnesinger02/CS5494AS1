@@ -1,0 +1,82 @@
+{
+  "candidates": 4000,
+  "per_digit": 10,
+  "order": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "runs": {
+    "fvsbn": {
+      "run": "results",
+      "base": "autoregressive",
+      "model": "fvsbn",
+      "which": "raw",
+      "side": 28,
+      "candidates": 4000,
+      "selected": 100,
+      "mean_confidence_selected": 0.7653,
+      "min_count": 52,
+      "png": "report/figures/digits_fvsbn.png",
+      "canonical": "results/autoregressive/fvsbn/samples_by_digit.png"
+    },
+    "made": {
+      "run": "results",
+      "base": "autoregressive",
+      "model": "made",
+      "which": "raw",
+      "side": 28,
+      "candidates": 4000,
+      "selected": 100,
+      "mean_confidence_selected": 0.8391,
+      "min_count": 249,
+      "png": "report/figures/digits_made.png",
+      "canonical": "results/autoregressive/made/samples_by_digit.png"
+    },
+    "mlp": {
+      "run": "results",
+      "base": "gan_mlp",
+      "model": "gan",
+      "which": "raw",
+      "side": 28,
+      "candidates": 4000,
+      "selected": 100,
+      "mean_confidence_selected": 0.8613,
+      "min_count": 295,
+      "png": "report/figures/digits_mlp.png",
+      "canonical": "results/gan_mlp/gan/samples_by_digit.png"
+    },
+    "dcgan_raw": {
+      "run": "results",
+      "base": "gan_ema",
+      "model": "gan",
+      "which": "raw",
+      "side": 28,
+      "candidates": 4000,
+      "selected": 100,
+      "mean_confidence_selected": 0.8703,
+      "min_count": 244,
+      "png": "report/figures/digits_dcgan_raw.png"
+    },
+    "dcgan_ema": {
+      "run": "results",
+      "base": "gan_ema",
+      "model": "gan",
+      "which": "ema",
+      "side": 28,
+      "candidates": 4000,
+      "selected": 100,
+      "mean_confidence_selected": 0.8699,
+      "min_count": 243,
+      "png": "report/figures/digits_dcgan_ema.png",
+      "canonical": "results/gan_ema/gan/samples_by_digit_ema.png"
+    }
+  }
+}

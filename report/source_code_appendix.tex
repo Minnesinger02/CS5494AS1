@@ -1,0 +1,1300 @@
+% ---------------------------------------------------------------------------------------
+% Appendix C: complete source code.
+% Generated from cs5494/ at packaging time. This is a snapshot: if the Python files are
+% edited afterwards, re-run the generator or delete this appendix. Long lines are folded by
+% the listings package for printing only; the authoritative copies are cs5494/*.py.
+% ---------------------------------------------------------------------------------------
+
+\newpage
+\section{Complete source code}
+\label{app:code}
+
+The shared folder contains the runnable package \texttt{cs5494/}. Appendix~A lists the
+commands that reproduce every table and figure, and Appendix~B maps each file to its
+responsibility. This appendix reproduces all eight modules verbatim so that the submitted
+report is self-contained even before a public code link is available. A single typographic
+dash in \texttt{compare\_runs.py} is printed as an ASCII hyphen; no executable statement is
+affected. Line breaks inserted by the typesetting of long source lines are visual only.
+
+\subsection*{cs5494/\_\_init\_\_.py --- package exports and version note}
+\begin{lstlisting}
+"""CS5494 assignment code: models, training, evaluation and figure generation.
+
+Modules
+    train.py          model definitions (FVSBN, MADE, MLP/DCGAN) and the training loop
+    sample.py         draw samples from a saved checkpoint (GAN: live or EMA weights)
+    evaluate.py       external scoring: classifier statistics for GANs, mixture likelihood
+    figures.py        report figures: per-digit grids, MLP variant comparison
+    checks.py         unit tests, NLL re-computation, report/JSON consistency, hashes
+    compare_runs.py   side-by-side comparison of result folders
+    sweep_made.py     hyper-parameter sweep for the masked autoregressive model
+
+Run everything from the repository root, e.g.
+
+    python -m cs5494.train --models fvsbn made --samples 60000 --side 28 --hidden 1536 ...
+    python -m cs5494.evaluate gan --runs results/gan_ema --weights ema
+    python -m cs5494.checks report
+"""
+\end{lstlisting}
+
+\subsection*{cs5494/train.py --- FVSBN, MADE, MLP-GAN, DCGAN and the training loop}
+\begin{lstlisting}
+"""CS5494: FVSBN, neural autoregressive MADE, and GAN on MNIST."""
+import argparse, json, random, time
+from pathlib import Path
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from torchvision.datasets import MNIST
+from torchvision import transforms
+from torchvision.utils import save_image
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+class MaskedLinear(nn.Linear):
+    def __init__(self, ni, no, mask):
+        super().__init__(ni, no)
+        self.register_buffer('mask', mask.float())
+    def forward(self, x):
+        return F.linear(x, self.weight * self.mask, self.bias)
+
+class Autoregressive(nn.Module):
+    def __init__(self, dim, hidden=0, layers=1, dropout=0.0):
+        super().__init__()
+        self.dim = dim
+        # Output i can only see pixels j < i; never the current/future pixel.
+        degrees = torch.arange(dim)
+        if hidden:
+            # MADE ordering: hidden degree cycles over 0..dim-2. Every edge keeps the
+            # hidden degree >= its input degree, and the output edge is strictly greater,
+            # so no path can carry information from pixel i or later into output i.
+            h = torch.arange(hidden) % (dim - 1)
+            seq = [MaskedLinear(dim, hidden, h[:,None] >= degrees[None,:]), nn.ReLU()]
+            if dropout > 0: seq.append(nn.Dropout(dropout))
+            for _ in range(max(1, layers) - 1):
+                seq += [MaskedLinear(hidden, hidden, h[:,None] >= h[None,:]), nn.ReLU()]
+                if dropout > 0: seq.append(nn.Dropout(dropout))
+            seq += [MaskedLinear(hidden, dim, degrees[:,None] > h[None,:])]
+            self.net = nn.Sequential(*seq)
+        else:
+            self.net = MaskedLinear(dim, dim, degrees[:,None] > degrees[None,:])
+    def forward(self, x):
+        return self.net(x)
+    @torch.no_grad()
+    def sample(self, n, device):
+        x = torch.zeros(n, self.dim, device=device)
+        for i in range(self.dim):
+            x[:,i] = torch.bernoulli(self(x)[:,i].sigmoid())
+        return x
+
+class Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(64,256),nn.LeakyReLU(.2),nn.Linear(256,512),nn.LeakyReLU(.2),nn.Linear(512,784),nn.Tanh())
+    def forward(self, z): return self.net(z)
+
+class Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(784,512),nn.LeakyReLU(.2),nn.Linear(512,256),nn.LeakyReLU(.2),nn.Linear(256,1))
+    def forward(self, x): return self.net(x).flatten()
+
+class DCGenerator(nn.Module):
+    """DCGAN generator, 64 -> 7x7 -> 14x14 -> 28x28, returned flattened like the MLP one."""
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(64,128*7*7), nn.Unflatten(1,(128,7,7)), nn.BatchNorm2d(128), nn.ReLU(True),
+            nn.ConvTranspose2d(128,64,4,2,1), nn.BatchNorm2d(64), nn.ReLU(True),
+            nn.ConvTranspose2d(64,1,4,2,1), nn.Tanh(), nn.Flatten(1))
+    def forward(self, z): return self.net(z)
+
+class DCDiscriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Unflatten(1,(1,28,28)),
+            nn.Conv2d(1,64,4,2,1), nn.LeakyReLU(.2),
+            nn.Conv2d(64,128,4,2,1), nn.BatchNorm2d(128), nn.LeakyReLU(.2),
+            nn.Flatten(1), nn.Linear(128*7*7,1))
+    def forward(self, x): return self.net(x).flatten()
+
+def build_gan(arch):
+    if arch == 'dcgan':
+        return DCGenerator(), DCDiscriminator()
+    return Generator(), Discriminator()
+
+def run(a):
+    random.seed(a.seed); np.random.seed(a.seed); torch.manual_seed(a.seed)
+    device = torch.device(a.device if a.device != 'auto' else ('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'))
+    if device.type=='cuda':
+        # Fixed-size layers: benchmark off, but allow TF32 matmuls on Ampere+ for speed.
+        torch.backends.cuda.matmul.allow_tf32 = bool(a.tf32)
+        torch.backends.cudnn.allow_tf32 = bool(a.tf32)
+    out = Path(a.output); out.mkdir(parents=True, exist_ok=True)
+    (out/'config.json').write_text(json.dumps(vars(a)|{'resolved_device':str(device),'device_name':torch.cuda.get_device_name(0) if device.type=='cuda' else str(device)},indent=2))
+    train = MNIST(a.data,train=True,download=True,transform=transforms.ToTensor())
+    test = MNIST(a.data,train=False,download=True,transform=transforms.ToTensor())
+    indices = torch.randperm(len(train))[:a.samples]
+    torch.save(indices,out/'training_indices.pt')
+    raw = train.data[indices].float().unsqueeze(1)/255
+    test_raw = test.data[:a.test_samples].float().unsqueeze(1)/255
+    metrics = {}
+    for name in a.models:
+        folder=out/name; folder.mkdir(exist_ok=True)
+        gan = name == 'gan'; side=28 if gan else a.side
+        x = raw.flatten(1)*2-1 if gan else (F.interpolate(raw,size=(side,side),mode='area')>=.5).float().flatten(1)
+        # Optional held-out split used only for hyperparameter selection (never for gradients).
+        if not gan and a.val > 0:
+            xval, xtr = x[:a.val], x[a.val:]
+        else:
+            xval, xtr = None, x
+        loader=DataLoader(TensorDataset(xtr),batch_size=a.batch,shuffle=True,num_workers=a.workers,
+                          pin_memory=device.type=='cuda',persistent_workers=a.workers>0)
+        if gan:
+            gen, discr = build_gan(a.arch)
+            model = gen.to(device); disc = discr.to(device)
+            opt = torch.optim.Adam(model.parameters(), lr=a.lr, betas=(.5,.999))
+            dop=torch.optim.Adam(disc.parameters(),lr=a.lr_d if a.lr_d else a.lr,betas=(.5,.999))
+            fixed=torch.randn(20,64,device=device)
+            # Exponential moving average of the generator parameters. Buffers such as
+            # BatchNorm running statistics are copied from the live model at save time.
+            ema = ({k: v.detach().clone() for k, v in model.named_parameters()}
+                   if a.ema > 0 else None)
+        else:
+            model=Autoregressive(side*side, a.hidden if name=='made' else 0,
+                                 a.layers if name=='made' else 1,
+                                 a.dropout if name=='made' else 0.0).to(device)
+            opt=torch.optim.Adam(model.parameters(),lr=a.lr,betas=(.9,.999),weight_decay=a.weight_decay)
+        sched=(torch.optim.lr_scheduler.CosineAnnealingLR(opt,T_max=a.epochs,eta_min=a.lr*.02)
+               if a.scheduler=='cosine' else None)
+        dsched=(torch.optim.lr_scheduler.CosineAnnealingLR(dop,T_max=a.epochs,eta_min=(a.lr_d or a.lr)*.02)
+                if gan and a.scheduler=='cosine' else None)
+        history=[]; snapshots=[]; start=time.perf_counter()
+        for epoch in range(a.epochs):
+            e0=time.perf_counter()
+            total=0.; dtotal=0.; count=0
+            for (batch,) in loader:
+                batch=batch.to(device,non_blocking=True); n=len(batch)
+                if gan:
+                    dop.zero_grad(); fake=model(torch.randn(n,64,device=device)).detach()
+                    dl=F.binary_cross_entropy_with_logits(disc(batch),torch.ones(n,device=device))+F.binary_cross_entropy_with_logits(disc(fake),torch.zeros(n,device=device))
+                    dl.backward(); dop.step(); dtotal+=dl.item()*n
+                    disc.requires_grad_(False)
+                    opt.zero_grad(); loss=F.binary_cross_entropy_with_logits(disc(model(torch.randn(n,64,device=device))),torch.ones(n,device=device))
+                    loss.backward(); opt.step(); disc.requires_grad_(True)
+                    if ema is not None:
+                        with torch.no_grad():
+                            for k, p in model.named_parameters():
+                                ema[k].mul_(a.ema).add_(p, alpha=1-a.ema)
+                else:
+                    opt.zero_grad(); loss=F.binary_cross_entropy_with_logits(model(batch),batch,reduction='none').sum(1).mean()
+                    loss.backward(); opt.step()
+                total+=loss.item()*n; count+=n
+            row={'epoch':epoch+1,'loss':total/count,'seconds':time.perf_counter()-e0}
+            if gan: row['discriminator_loss']=dtotal/count
+            history.append(row); print(name,{k:(round(v,4) if isinstance(v,float) else v) for k,v in row.items()},flush=True)
+            if sched: sched.step()
+            if dsched: dsched.step()
+            if epoch in {0,a.epochs//4,a.epochs//2,3*a.epochs//4,a.epochs-1}:
+                model.eval()
+                with torch.no_grad(): samples=(model(fixed)+1)/2 if gan else model.sample(20,device)
+                model.train()
+                images=samples.cpu().reshape(-1,1,side,side); save_image(images,folder/f'epoch_{epoch+1:03}.png',nrow=5); snapshots.append(images[:4])
+        if device.type=='mps': torch.mps.synchronize()
+        if device.type=='cuda': torch.cuda.synchronize()
+        elapsed=time.perf_counter()-start
+        model.eval()
+        inference_start=time.perf_counter()
+        with torch.no_grad(): samples=(model(torch.randn(100,64,device=device))+1)/2 if gan else model.sample(100,device)
+        images=samples.cpu().reshape(-1,1,side,side)
+        infer=time.perf_counter()-inference_start
+        save_image(images,folder/'samples.png',nrow=10)
+        save_image(torch.cat(snapshots),folder/'progress.png',nrow=4)
+        torch.save(model.state_dict(),folder/'model.pt')
+        if gan:
+            torch.save(disc.state_dict(),folder/'discriminator.pt')
+            if ema is not None:
+                sd = {k: v.clone() for k, v in model.state_dict().items()}
+                for k, v in ema.items():
+                    sd[k] = v.clone()
+                torch.save(sd, folder/'model_ema.pt')
+        result={'training_and_preview_seconds':elapsed,'inference_100_seconds':infer,'training_samples':len(xtr)}
+        if gan and ema is not None:
+            result['ema_decay'] = a.ema
+        if not gan:
+            def _nll(batch_x):
+                with torch.no_grad():
+                    return sum(F.binary_cross_entropy_with_logits(model(b.to(device)),b.to(device),reduction='sum').item()
+                               for b in batch_x.split(a.batch))/len(batch_x)
+            tx=(F.interpolate(test_raw,size=(side,side),mode='area')>=.5).float().flatten(1)
+            nll=_nll(tx)
+            result|={'test_nll_nats_per_image':nll,'test_bits_per_pixel':nll/(side*side*np.log(2))}
+            if xval is not None:
+                vnll=_nll(xval)
+                result|={'validation_samples':len(xval),'validation_nll_nats_per_image':vnll,
+                         'validation_bits_per_pixel':vnll/(side*side*np.log(2))}
+        metrics[name]=result
+        print(name,'summary',{k:round(v,4) for k,v in result.items()},flush=True)
+        (folder/'history.json').write_text(json.dumps(history,indent=2))
+        plt.figure(); plt.plot([r['epoch'] for r in history],[r['loss'] for r in history],label='G BCE' if gan else 'NLL (nats/image)')
+        if gan: plt.plot([r['epoch'] for r in history],[r['discriminator_loss'] for r in history],label='D BCE')
+        plt.xlabel('Epoch'); plt.legend(); plt.tight_layout(); plt.savefig(folder/'loss.png'); plt.close()
+        (out/'metrics.json').write_text(json.dumps(metrics,indent=2))
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser()
+    p.add_argument('--models',nargs='+',choices=['fvsbn','made','gan'],default=['fvsbn','made','gan'])
+    p.add_argument('--data',default='data'); p.add_argument('--output',default='outputs/main')
+    p.add_argument('--samples',type=int,default=20000); p.add_argument('--test-samples',type=int,default=2000)
+    p.add_argument('--epochs',type=int,default=20); p.add_argument('--batch',type=int,default=128)
+    p.add_argument('--side',type=int,default=14); p.add_argument('--hidden',type=int,default=512)
+    p.add_argument('--layers',type=int,default=1,help='masked hidden layers for MADE')
+    p.add_argument('--dropout',type=float,default=0.0,help='dropout on MADE hidden activations')
+    p.add_argument('--weight-decay',dest='weight_decay',type=float,default=0.0)
+    p.add_argument('--val',type=int,default=0,help='leading samples held out as validation (autoregressive only)')
+    p.add_argument('--arch',choices=['mlp','dcgan'],default='mlp',help='GAN generator/discriminator architecture')
+    p.add_argument('--scheduler',choices=['none','cosine'],default='none')
+    p.add_argument('--ema',type=float,default=0.0,
+                   help='decay for an exponential moving average of the GAN generator (0 disables)')
+    p.add_argument('--lr',type=float,default=.0002); p.add_argument('--seed',type=int,default=42); p.add_argument('--device',default='auto')
+    p.add_argument('--lr-d',dest='lr_d',type=float,default=0.0,
+                   help='optional discriminator learning rate (TTUR); 0 keeps --lr')
+    p.add_argument('--workers',type=int,default=0)
+    p.add_argument('--tf32',type=int,default=1,choices=[0,1])
+    a=p.parse_args()
+    if not (2<=a.side<=28 and a.samples>0 and a.test_samples>0 and a.epochs>0 and a.batch>0): p.error('invalid dimensions or counts')
+    run(a)
+\end{lstlisting}
+
+\subsection*{cs5494/sample.py --- draw samples from a saved checkpoint}
+\begin{lstlisting}
+"""Generate samples from a saved run without retraining.
+
+Reads the architecture back from the run's config.json, so MLP and DCGAN checkpoints
+both work, as do linear FVSBNs and multi-layer MADE models.
+"""
+import argparse,json
+from pathlib import Path
+import torch
+from cs5494.train import Autoregressive, build_gan
+from torchvision.utils import save_image
+p=argparse.ArgumentParser(); p.add_argument('run'); p.add_argument('model',choices=['fvsbn','made','gan']); p.add_argument('--seed',type=int,default=123); p.add_argument('--which',choices=['raw','ema'],default='raw',help='GAN only: use model_ema.pt'); a=p.parse_args()
+r=Path(a.run); c=json.loads((r/'config.json').read_text()); torch.manual_seed(a.seed)
+gan=a.model=='gan'; side=28 if gan else c['side']
+if gan:
+    m=build_gan(c.get('arch','mlp'))[0]
+else:
+    m=Autoregressive(side*side,c['hidden'] if a.model=='made' else 0,c.get('layers',1),c.get('dropout',0.0))
+ckpt = r/a.model/(('model_ema.pt' if a.which=='ema' else 'model.pt') if gan else 'model.pt')
+m.load_state_dict(torch.load(ckpt,map_location='cpu',weights_only=True)); m.eval()
+n=64 if gan else 100
+with torch.no_grad(): x=(m(torch.randn(n,64))+1)/2 if gan else m.sample(n,'cpu')
+tag = 'samples_seed_%d%s.png' % (a.seed, '_ema' if (gan and a.which=='ema') else '')
+save_image(x.reshape(-1,1,side,side),r/a.model/tag,nrow=10)
+\end{lstlisting}
+
+\subsection*{cs5494/evaluate.py --- independent classifier scores and mixture likelihood}
+\begin{lstlisting}
+"""External evaluation for the generative models.
+
+Two sub-commands, both standardising their output as JSON next to the report:
+
+    gan       trains (or loads) an independent MNIST classifier and scores every GAN
+              checkpoint with confidence, class entropy and a feature Frechet distance.
+    mixture   computes the held-out likelihood of a mixture of autoregressive models,
+              p(x) = 1/K * sum_k p_k(x), for K = 1..n and writes the K-vs-bpp curve.
+
+Examples
+    python -m cs5494.evaluate gan --runs results/gan_ema --weights ema
+    python -m cs5494.evaluate mixture --runs results/made_seed42 results/made_seed43 \
+        results/made_seed44 --out results/ensemble_metrics.json
+"""
+import argparse, io, json, time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torchvision.datasets import MNIST
+
+from cs5494.train import Autoregressive, build_gan
+
+
+# --------------------------------------------------------------------------------------
+# classifier used as an independent evaluator (also labels the per-digit figures)
+# --------------------------------------------------------------------------------------
+class Clf(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Flatten(), nn.Linear(32*7*7, 128), nn.ReLU(), nn.Linear(128, 10))
+
+    def forward(self, x):
+        return self.net(x)
+
+    def features(self, x):
+        """128-d penultimate activations, used by the Frechet-distance proxy."""
+        return self.net[:-2](x)
+
+
+def load_classifier(path='comparisons/gan_classifier.pt', device='cpu'):
+    clf = Clf()
+    clf.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+    return clf.to(device).eval()
+
+
+def train_or_load(args, dev):
+    """Return an evaluated classifier, training it once if the cache is missing."""
+    tr = MNIST('data', train=True, download=True)
+    te = MNIST('data', train=False, download=True)
+    xs = (tr.data.float()/255).unsqueeze(1)
+    ys = tr.targets.clone()
+    xt = (te.data.float()/255).unsqueeze(1).to(dev)
+    yt = te.targets.clone().to(dev)
+
+    clf = Clf().to(dev)
+    ckpt = Path(args.classifier)
+    if ckpt.exists():
+        clf.load_state_dict(torch.load(ckpt, map_location=dev, weights_only=True))
+        print('loaded cached classifier', ckpt)
+    else:
+        opt = torch.optim.Adam(clf.parameters(), 1e-3)
+        n = min(args.train_n, len(xs))
+        for ep in range(args.epochs):
+            perm = torch.randperm(n)
+            for i in range(0, n, 256):
+                idx = perm[i:i+256]
+                opt.zero_grad()
+                F.cross_entropy(clf(xs[idx].to(dev)), ys[idx].to(dev)).backward()
+                opt.step()
+            with torch.no_grad():
+                acc = (clf(xt).argmax(1) == yt).float().mean().item()
+            print(f'classifier epoch {ep+1}: test acc {acc:.4f}')
+        ckpt.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(clf.state_dict(), ckpt)
+    clf.eval()
+    return clf, xt, yt
+
+
+def frechet(a, b):
+    """Frechet distance between two feature Gaussians (the FID formula)."""
+    from scipy.linalg import sqrtm
+    mu1, mu2 = a.mean(0), b.mean(0)
+    c1, c2 = np.cov(a, rowvar=False), np.cov(b, rowvar=False)
+    covmean = sqrtm(c1 @ c2)
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    return float(((mu1-mu2)**2).sum() + np.trace(c1 + c2 - 2*covmean))
+
+
+# --------------------------------------------------------------------------------------
+# gan: classifier statistics
+# --------------------------------------------------------------------------------------
+def cmd_gan(a):
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.manual_seed(0)
+    clf, xt, yt = train_or_load(a, dev)
+
+    with torch.no_grad():
+        acc = (clf(xt).argmax(1) == yt).float().mean().item()
+        print(f'evaluator accuracy on 10,000 real test images: {acc:.4f}')
+        p = clf(xt[:5000]).softmax(1)
+        hist = torch.bincount(p.argmax(1), minlength=10).float()/len(p)
+        ref = {'conf': p.max(1).values.mean().item(),
+               'entropy': float(-(hist*torch.log(hist.clamp_min(1e-12))).sum()),
+               'acc': acc}
+        real_feat = clf.features(xt[:5000]).double().cpu().numpy()
+    print('real MNIST reference:', {k: round(v, 4) for k, v in ref.items()})
+    print(f'real self-FD (sanity, should be ~0): {frechet(real_feat, real_feat[500:]):.3f}')
+
+    res = {'classifier_test_acc': acc, 'reference_real_mnist': ref, 'runs': {}}
+    ckpt_name = 'model_ema.pt' if a.weights == 'ema' else 'model.pt'
+    for run in a.runs:
+        if not (Path(run)/'gan'/ckpt_name).exists():
+            print('skip (no checkpoint):', run, ckpt_name)
+            continue
+        cfg = json.loads(io.open(Path(run)/'config.json', encoding='utf-8').read())
+        g = build_gan(cfg.get('arch', 'mlp'))[0].to(dev)
+        g.load_state_dict(torch.load(Path(run)/'gan'/ckpt_name, map_location=dev, weights_only=True))
+        g.eval()
+        key = run if a.weights == 'raw' else f'{run}::{a.weights}'
+        torch.manual_seed(123)
+        with torch.no_grad():
+            imgs = (g(torch.randn(a.n, 64, device=dev))+1)/2
+            imgs = imgs.clamp(0, 1).reshape(-1, 1, 28, 28)
+            p = clf(imgs).softmax(1)
+        hist = torch.bincount(p.argmax(1), minlength=10).float()/len(p)
+        ent = float(-(hist*torch.log(hist.clamp_min(1e-12))).sum())
+        with torch.no_grad():
+            gen_feat = clf.features(imgs).double().cpu().numpy()
+        fd = frechet(real_feat, gen_feat)
+        row = {'conf': p.max(1).values.mean().item(), 'entropy': ent, 'fd': fd, 'acc': None,
+               'classes_used': int((hist > 0.005).sum()),
+               'class_hist': [round(float(v), 4) for v in hist],
+               'blank_rate': float(((imgs.mean((1, 2, 3)) < .02) | (imgs.mean((1, 2, 3)) > .98)).float().mean())}
+        res['runs'][key] = row
+        print(f"{key:56s} conf={row['conf']:.4f} entropy={row['entropy']:.4f} "
+              f"FD={fd:8.2f} classes={row['classes_used']:2d} blank={row['blank_rate']:.3f}")
+
+    out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(res, indent=2), encoding='utf-8')
+    print('written', out)
+
+
+# --------------------------------------------------------------------------------------
+# mixture: likelihood of K autoregressive members
+# --------------------------------------------------------------------------------------
+def _load_member(run, device):
+    run = Path(run)
+    cfg = json.loads(io.open(run/'config.json', encoding='utf-8').read())
+    side = cfg['side']
+    model = Autoregressive(side*side, cfg['hidden'], cfg.get('layers', 1), cfg.get('dropout', 0.0))
+    model.load_state_dict(torch.load(run/'made/model.pt', map_location=device, weights_only=True))
+    return model.to(device).eval(), cfg, side
+
+
+@torch.no_grad()
+def _per_image_nll(model, x, device, batch=128):
+    out = []
+    for b in x.split(batch):
+        b = b.to(device)
+        out.append(F.binary_cross_entropy_with_logits(model(b), b, reduction='none').sum(1).cpu())
+    return torch.cat(out)
+
+
+def cmd_mixture(a):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    models, cfgs, side = [], [], None
+    for r in a.runs:
+        m, cfg, s = _load_member(r, dev)
+        models.append(m); cfgs.append(cfg); side = s
+
+    test = MNIST('data', train=False, download=True)
+    n = cfgs[0]['test_samples']
+    raw = test.data[:n].float().unsqueeze(1)/255
+    x = (F.interpolate(raw, size=(side, side), mode='area') >= .5).float().flatten(1)
+    scale = side*side*np.log(2)
+
+    members, nlls = [], []
+    for run, m, cfg in zip(a.runs, models, cfgs):
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            m.sample(100, dev)
+        infer = time.perf_counter()-t0
+        p = _per_image_nll(m, x, dev)
+        nlls.append(p)
+        members.append({'run': str(run), 'seed': cfg.get('seed'),
+                        'nats': float(p.mean()), 'bpp': float(p.mean()/scale),
+                        'params': int(sum(q.numel() for q in m.parameters())),
+                        'inference_100_seconds': infer})
+        print(f"{str(run):34s} seed={cfg.get('seed')} nats={p.mean():.4f} bpp={p.mean()/scale:.4f}")
+
+    metrics = {'side': side, 'test_samples': n, 'members': members, 'ensembles': []}
+    plots = []
+    for k in range(2, len(nlls)+1):
+        mix = torch.logsumexp(-torch.stack(nlls[:k]), dim=0) - np.log(k)
+        nats = float((-mix).mean())
+        params = sum(m['params'] for m in members[:k])
+        metrics['ensembles'].append({'k': k, 'members': [m['run'] for m in members[:k]],
+                                     'nats': nats, 'bpp': nats/scale, 'params': params})
+        print(f'mixture K={k}  nats={nats:.4f}  bpp={nats/scale:.4f}  params={params}')
+        plots.append((k, nats/scale))
+    plots.insert(0, (1, members[0]['bpp']))
+
+    out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(metrics, indent=2), encoding='utf-8')
+    print('written', out)
+
+    plt.figure(figsize=(5.2, 3.2))
+    ks, bpps = zip(*plots)
+    plt.plot(ks, bpps, 'o-')
+    for k, b in plots:
+        plt.annotate(f'{b:.4f}', (k, b), textcoords='offset points', xytext=(0, 6), ha='center', fontsize=8)
+    plt.xticks(ks); plt.xlabel('number of mixture members K')
+    plt.ylabel('test bits/pixel'); plt.title('MADE mixture, test split')
+    plt.tight_layout()
+    Path(a.figure).parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(a.figure, dpi=130); plt.close()
+    print('written', a.figure)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    g = sub.add_parser('gan', help='classifier statistics for GAN checkpoints')
+    g.add_argument('--runs', nargs='+', default=['results/gan_initial', 'results/gan_mlp'])
+    g.add_argument('--n', type=int, default=2000)
+    g.add_argument('--weights', choices=['raw', 'ema'], default='raw')
+    g.add_argument('--train-n', type=int, default=20000)
+    g.add_argument('--epochs', type=int, default=3)
+    g.add_argument('--classifier', default='comparisons/gan_classifier.pt')
+    g.add_argument('--out', default='comparisons/gan_eval.json')
+    g.set_defaults(func=cmd_gan)
+
+    m = sub.add_parser('mixture', help='held-out likelihood of a mixture of MADE models')
+    m.add_argument('--runs', nargs='+', required=True)
+    m.add_argument('--out', default='results/ensemble_metrics.json')
+    m.add_argument('--figure', default='results/ensemble_ablation.png')
+    m.set_defaults(func=cmd_mixture)
+
+    a = ap.parse_args(argv)
+    a.func(a)
+
+
+if __name__ == '__main__':
+    main()
+\end{lstlisting}
+
+\subsection*{cs5494/figures.py --- per-digit grids and the MLP training-regime figure}
+\begin{lstlisting}
+"""Figures used by the report.
+
+    digits     draws unconditional samples from every reported model, labels them with the
+               independent classifier and keeps the first N per predicted digit, producing a
+               grid with one column per digit (a selection, not conditional generation).
+    variants   stacks the three MLP-GAN sample grids (shared lr / larger batch / TTUR) with
+               the feature distances read from comparisons/gan_eval.json.
+
+Examples
+    python -m cs5494.figures digits --candidates 4000 --order 0123456789
+    python -m cs5494.figures variants
+"""
+import argparse, io, json
+from pathlib import Path
+
+import torch
+from PIL import Image, ImageDraw, ImageFont
+
+from cs5494.train import Autoregressive, build_gan
+from cs5494.evaluate import load_classifier
+
+# label, run folder, base folder, model name, which checkpoint
+DEFAULT_SPECS = [
+    ('fvsbn', 'results', 'autoregressive', 'fvsbn', 'raw'),
+    ('made', 'results', 'autoregressive', 'made', 'raw'),
+    ('mlp', 'results', 'gan_mlp', 'gan', 'raw'),
+    ('dcgan_raw', 'results', 'gan_ema', 'gan', 'raw'),
+    ('dcgan_ema', 'results', 'gan_ema', 'gan', 'ema'),
+]
+COMPOSITE = ['fvsbn', 'made', 'dcgan_ema']
+TITLES = {'fvsbn': 'FVSBN', 'made': 'MADE', 'mlp': 'MLP-GAN',
+          'dcgan_raw': 'DCGAN (live)', 'dcgan_ema': 'DCGAN (EMA)'}
+
+
+def _load_model(run, base, name, which, device):
+    run = Path(run)
+    cfg = json.loads(io.open(run/base/'config.json', encoding='utf-8').read())
+    if name == 'gan':
+        model = build_gan(cfg.get('arch', 'mlp'))[0]
+        side = 28
+        ckpt = run/base/name/('model_ema.pt' if which == 'ema' else 'model.pt')
+    else:
+        side = cfg['side']
+        model = Autoregressive(side*side, cfg['hidden'] if name == 'made' else 0,
+                               cfg.get('layers', 1), cfg.get('dropout', 0.0))
+        ckpt = run/base/name/'model.pt'
+    model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+    return model.to(device).eval(), cfg, side
+
+
+@torch.no_grad()
+def _draw(model, name, side, n, device):
+    x = (model(torch.randn(n, 64, device=device))+1)/2 if name == 'gan' else model.sample(n, device)
+    return x.clamp(0, 1).reshape(-1, 1, side, side)
+
+
+@torch.no_grad()
+def _classify(clf, imgs, batch=512):
+    probs = torch.cat([clf(b).softmax(1) for b in imgs.split(batch)])
+    return probs.argmax(1).cpu(), probs.max(1).values.cpu()
+
+
+def _grid_png(imgs, path, order, cell=56, header=34, pad=6):
+    rows = imgs.shape[0] // len(order)
+    tiles = imgs.reshape(rows, len(order), *imgs.shape[1:])
+    w = len(order)*cell + (len(order)+1)*pad
+    h = rows*cell + (rows+1)*pad + header
+    canvas = Image.new('RGB', (w, h), 'white')
+    d = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default(size=20)
+    except TypeError:
+        font = ImageFont.load_default()
+    for c, digit in enumerate(order):
+        d.text((pad + c*(cell+pad) + cell//2 - 6, 6), str(digit), fill='black', font=font)
+    for r in range(rows):
+        for c in range(len(order)):
+            arr = (tiles[r, c].cpu().numpy().transpose(1, 2, 0)*255).astype('uint8')
+            im = Image.fromarray(arr.squeeze()).resize((cell, cell), Image.NEAREST).convert('RGB')
+            canvas.paste(im, (pad + c*(cell+pad), header + pad + r*(cell+pad)))
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+    return canvas
+
+
+def _composite(panels, path, gap=26):
+    try:
+        font = ImageFont.load_default(size=26)
+    except TypeError:
+        font = ImageFont.load_default()
+    w = sum(p.width for _, p in panels) + gap*(len(panels)+1)
+    h = max(p.height for _, p in panels) + 52
+    canvas = Image.new('RGB', (w, h), 'white')
+    d = ImageDraw.Draw(canvas)
+    x = gap
+    for title, p in panels:
+        d.text((x, 12), title, fill='black', font=font)
+        canvas.paste(p, (x, 46))
+        x += p.width + gap
+    path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+    return canvas
+
+
+def cmd_digits(a):
+    order = [int(c) for c in a.order]
+    dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    clf = load_classifier(a.classifier, dev)
+    stats = {'candidates': a.candidates, 'per_digit': a.per_digit, 'order': order, 'runs': {}}
+    panels = {}
+
+    for label, run, base, name, which in DEFAULT_SPECS:
+        model, cfg, side = _load_model(run, base, name, which, dev)
+        torch.manual_seed(a.seed)
+        imgs = _draw(model, name, side, a.candidates, dev)
+        pred, conf = _classify(clf, imgs)
+        picks, counts = [], {}
+        for digit in order:
+            idx = (pred == digit).nonzero(as_tuple=True)[0]
+            counts[str(digit)] = int(len(idx))
+            picks.append(idx[:a.per_digit])
+        if any(len(p) < a.per_digit for p in picks):
+            short = {d: c for d, c in counts.items() if c < a.per_digit}
+            print(f'  WARNING {label}: not enough samples for {short}; increase --candidates')
+            continue
+        sel = torch.stack(picks, 1).reshape(-1)      # rows = draws, columns = digits
+        chosen = imgs[sel]
+        out = Path(a.outdir)/f'digits_{label}.png'
+        canvas = _grid_png(chosen, out, order)
+        panels[label] = (TITLES.get(label, label), canvas)
+        mconf = conf[sel].mean().item()
+        stats['runs'][label] = {'run': run, 'base': base, 'model': name, 'which': which,
+                                'side': side, 'candidates': a.candidates,
+                                'selected': int(len(sel)), 'mean_confidence_selected': round(mconf, 4),
+                                'min_count': min(counts.values()), 'png': out.as_posix()}
+        print(f'{label:10s} candidates={a.candidates} selected={len(sel)} '
+              f'mean_conf={mconf:.3f} min_count={min(counts.values()):4d} -> {out}')
+
+        if label in ('fvsbn', 'made', 'mlp') or label == 'dcgan_ema':
+            canon = Path(run)/base/name/('samples_by_digit_ema.png' if which == 'ema' else 'samples_by_digit.png')
+            _grid_png(chosen, canon, order)
+            stats['runs'][label]['canonical'] = canon.as_posix()
+
+    if all(k in panels for k in COMPOSITE):
+        _composite([panels[k] for k in COMPOSITE], a.composite)
+        print('written', a.composite)
+
+    Path(a.stats).write_text(json.dumps(stats, indent=2), encoding='utf-8')
+    print('written', a.stats)
+
+
+MLP_ROWS = [
+    ('results/gan_initial/gan/samples.png', 'shared lr, 60 epochs (batch 128)'),
+    ('results/gan_mlp_shared_lr/gan/samples.png', 'shared lr, 150 epochs (batch 256)'),
+    ('results/gan_mlp/gan/samples.png', 'two-timescale, 150 epochs'),
+]
+MLP_KEYS = ['results/gan_initial', 'results/gan_mlp_shared_lr', 'results/gan_mlp']
+
+
+def cmd_variants(a):
+    ev = json.loads(io.open(a.eval, encoding='utf-8').read()) if Path(a.eval).exists() else {}
+    try:
+        font = ImageFont.load_default(size=20)
+    except TypeError:
+        font = ImageFont.load_default()
+
+    panels = []
+    for (path, title), key in zip(MLP_ROWS, MLP_KEYS):
+        p = Path(path)
+        if not p.exists():
+            print('missing, skipped:', path)
+            continue
+        st = ev.get('runs', {}).get(key, {})
+        cap = f"{title}  |  FD {st['fd']:.1f}" if 'fd' in st else title
+        im = Image.open(p).convert('RGB').resize((a.width, a.width), Image.NEAREST)
+        panels.append((cap, im))
+
+    gap, header = 10, 34
+
+    def text_w(s):
+        try:
+            return int(font.getlength(s))
+        except Exception:
+            return len(s)*11
+
+    width = max([a.width + 2*gap] + [text_w(cap) + 2*gap + 8 for cap, _ in panels])
+    canvas = Image.new('RGB', (width, sum(p.height + header + gap for _, p in panels) + gap), 'white')
+    d = ImageDraw.Draw(canvas)
+    y = gap
+    for cap, im in panels:
+        d.text((gap, y + 6), cap, fill='black', font=font)
+        canvas.paste(im, (gap, y + header))
+        y += im.height + header + gap
+    out = Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out)
+    print('written', out, canvas.size)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    d = sub.add_parser('digits', help='per-digit sample grids for every reported model')
+    d.add_argument('--classifier', default='comparisons/gan_classifier.pt')
+    d.add_argument('--candidates', type=int, default=4000)
+    d.add_argument('--per-digit', type=int, default=10)
+    d.add_argument('--seed', type=int, default=123)
+    d.add_argument('--order', default='0123456789')
+    d.add_argument('--outdir', default='report/figures')
+    d.add_argument('--composite', default='comparisons/digit_grid_comparison.png')
+    d.add_argument('--stats', default='comparisons/digit_grid.json')
+    d.set_defaults(func=cmd_digits)
+
+    v = sub.add_parser('variants', help='MLP-GAN training-regime comparison figure')
+    v.add_argument('--eval', default='comparisons/gan_eval.json')
+    v.add_argument('--out', default='comparisons/mlp_gan_variants.png')
+    v.add_argument('--width', type=int, default=302)
+    v.set_defaults(func=cmd_variants)
+
+    a = ap.parse_args(argv)
+    a.func(a)
+
+
+if __name__ == '__main__':
+    main()
+\end{lstlisting}
+
+\subsection*{cs5494/checks.py --- unit checks, NLL re-computation, report and manifest}
+\begin{lstlisting}
+"""Repository checks.
+
+    units      causal-gradient / shape assertions for all three model families
+    nll        recompute held-out NLL from saved checkpoints and compare with metrics.json
+    report     extract the numbers printed in report/main.pdf and compare with the JSON files
+    manifest   create or verify a SHA256 manifest of a folder tree
+
+Examples
+    python -m cs5494.checks units
+    python -m cs5494.checks nll --runs results/autoregressive
+    python -m cs5494.checks report
+    python -m cs5494.checks manifest . --verify
+"""
+import argparse, hashlib, io, json, sys
+from pathlib import Path
+
+import torch
+from torch.nn import functional as F
+from torchvision.datasets import MNIST
+
+from cs5494.train import Autoregressive, Generator, Discriminator
+
+
+# --------------------------------------------------------------------------------------
+# units
+# --------------------------------------------------------------------------------------
+def cmd_units(a):
+    for hidden in (0, 32):
+        model = Autoregressive(16, hidden)
+        x = torch.randn(3, 16, requires_grad=True)
+        for i in range(16):
+            g = torch.autograd.grad(model(x)[:, i].sum(), x, retain_graph=True)[0]
+            assert torch.count_nonzero(g[:, i:]) == 0, 'causality violated'
+        sample = model.sample(5, 'cpu')
+        assert sample.shape == (5, 16) and ((sample == 0) | (sample == 1)).all()
+    fake = Generator()(torch.randn(5, 64))
+    assert fake.shape == (5, 784) and fake.abs().max() <= 1
+    assert Discriminator()(fake).shape == (5,)
+    print('PASS: causal gradients, binary sampling, GAN shapes and range')
+
+
+# --------------------------------------------------------------------------------------
+# nll
+# --------------------------------------------------------------------------------------
+def cmd_nll(a):
+    test = MNIST(a.data, train=False, download=True)
+    bad = 0
+    for run in a.runs:
+        run = Path(run)
+        if not (run/'metrics.json').exists():
+            print('skip (no metrics.json):', run)
+            continue
+        cfg = json.loads(io.open(run/'config.json', encoding='utf-8').read())
+        metrics = json.loads(io.open(run/'metrics.json', encoding='utf-8').read())
+        if 'gan' in metrics:
+            continue
+        side = cfg['side']
+        raw = test.data[:cfg['test_samples']].float().unsqueeze(1)/255
+        tx = (F.interpolate(raw, size=(side, side), mode='area') >= .5).float().flatten(1)
+        for name in metrics:
+            ckpt = run/name/'model.pt'
+            if not ckpt.exists():
+                continue
+            m = Autoregressive(side*side, cfg['hidden'] if name == 'made' else 0,
+                               cfg.get('layers', 1), cfg.get('dropout', 0.0))
+            m.load_state_dict(torch.load(ckpt, map_location='cpu', weights_only=True))
+            m.eval()
+            with torch.no_grad():
+                nll = sum(F.binary_cross_entropy_with_logits(m(b), b, reduction='sum').item()
+                          for b in tx.split(128))/len(tx)
+            saved = metrics[name]['test_nll_nats_per_image']
+            ok = abs(nll-saved) <= a.tol
+            bad += 0 if ok else 1
+            print(f'{run.as_posix():34s} {name:6s} recomputed={nll:.5f} saved={saved:.5f} '
+                  f'diff={abs(nll-saved):.1e} {"OK" if ok else "MISMATCH"}')
+    print('all consistent' if bad == 0 else f'{bad} mismatches')
+    return 1 if bad else 0
+
+
+# --------------------------------------------------------------------------------------
+# report
+# --------------------------------------------------------------------------------------
+def cmd_report(a):
+    import pymupdf
+
+    root = Path(__file__).resolve().parents[1]
+    text = '\n'.join(p.get_text() for p in pymupdf.open(root/a.pdf))
+
+    def load(p):
+        return json.loads(io.open(root/p, encoding='utf-8').read())
+
+    ar = load('results/autoregressive/metrics.json')
+    ab = load('results/ablation_10k/metrics.json')
+    ens = load('results/ensemble_metrics.json')
+    ens10 = load('results/ensemble_10k_metrics.json')
+    ev = load('comparisons/gan_eval.json')
+    ev2 = load('comparisons/gan_eval_ema.json')
+    ev3 = load('comparisons/gan_eval_ema_tmp.json')
+
+    members = ens['members']
+    mean_nats = sum(m['nats'] for m in members)/len(members)
+    mean_bpp = sum(m['bpp'] for m in members)/len(members)
+    m10 = ens10['members']
+    mean10_nats = sum(m['nats'] for m in m10)/len(m10)
+    k3 = ens['ensembles'][-1]
+    k3_10 = ens10['ensembles'][-1]
+    mlp_arch = ev['runs']['results/gan_initial']
+    mlp_shared = ev['runs']['results/gan_mlp_shared_lr']
+    mlp_ttur = ev['runs']['results/gan_mlp']
+    dcgan_raw = ev2['runs']['results/gan_ema']
+    dcgan_ema = ev3['runs']['results/gan_ema::ema']
+
+    checks = [
+        ('FVSBN 60k nats', f"{ar['fvsbn']['test_nll_nats_per_image']:.2f}", '75.72'),
+        ('FVSBN 60k bpp', f"{ar['fvsbn']['test_bits_per_pixel']:.4f}", '0.1393'),
+        ('FVSBN 60k train s', f"{ar['fvsbn']['training_and_preview_seconds']:.1f}", '47.4'),
+        ('MADE mean nats', f'{mean_nats:.2f}', '68.45'),
+        ('MADE mean bpp', f'{mean_bpp:.4f}', '0.1260'),
+        ('MADE K=2 nats', f"{ens['ensembles'][0]['nats']:.2f}", '67.07'),
+        ('MADE K=3 nats', f"{k3['nats']:.2f}", '66.46'),
+        ('MADE K=3 bpp', f"{k3['bpp']:.4f}", '0.1223'),
+        ('FVSBN 10k nats', f"{ab['fvsbn']['test_nll_nats_per_image']:.2f}", '120.17'),
+        ('FVSBN 10k bpp', f"{ab['fvsbn']['test_bits_per_pixel']:.4f}", '0.2211'),
+        ('MADE 10k mean nats', f'{mean10_nats:.2f}', '80.19'),
+        ('MADE 10k K=3 bpp', f"{k3_10['bpp']:.4f}", '0.1415'),
+        ('MLP initial FD', f"{mlp_arch['fd']:.2f}", '34.61'),
+        ('MLP shared-lr FD', f"{mlp_shared['fd']:.2f}", '38.30'),
+        ('MLP TTUR FD', f"{mlp_ttur['fd']:.2f}", '7.71'),
+        ('DCGAN live FD', f"{dcgan_raw['fd']:.2f}", '7.15'),
+        ('DCGAN EMA FD', f"{dcgan_ema['fd']:.2f}", '7.12'),
+    ]
+
+    bad = 0
+    for name, computed, printed in checks:
+        if computed != printed:
+            print(f'ROUNDING DRIFT  {name}: computed {computed}, report {printed}')
+            bad += 1
+        if printed not in text:
+            print(f'MISSING IN PDF  {name}: {printed}')
+            bad += 1
+    print(f'{len(checks)} numbers checked, {bad} problem(s)')
+    return 1 if bad else 0
+
+
+# --------------------------------------------------------------------------------------
+# manifest
+# --------------------------------------------------------------------------------------
+def _sha(p):
+    h = hashlib.sha256()
+    with open(p, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cmd_manifest(a):
+    root = Path(a.root)
+    out = Path(a.out) if a.out else root/'MANIFEST_SHA256.json'
+    if a.verify:
+        manifest = json.loads(io.open(out, encoding='utf-8').read())
+        bad = [rel for rel, want in manifest.items()
+               if not (root/rel).exists() or _sha(root/rel) != want]
+        print(f'{len(manifest)} entries, {len(bad)} mismatched')
+        for rel in bad[:20]:
+            print('MISMATCH', rel)
+        return 1 if bad else 0
+
+    files = {}
+    for p in sorted(root.rglob('*')):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(root).as_posix()
+        if p.name in {out.name, '__pycache__'} or p.suffix == '.pyc':
+            continue
+        files[rel] = _sha(p)
+    out.write_text(json.dumps(files, indent=2, ensure_ascii=False), encoding='utf-8')
+    print(f'wrote {out} with {len(files)} entries')
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    u = sub.add_parser('units', help='causality and shape assertions')
+    u.set_defaults(func=cmd_units)
+
+    n = sub.add_parser('nll', help='recompute NLL from checkpoints')
+    n.add_argument('--runs', nargs='+', default=['results/autoregressive', 'results/ablation_10k'])
+    n.add_argument('--data', default='data')
+    n.add_argument('--tol', type=float, default=1e-3,
+                   help='GPU checkpoints differ from the CPU recomputation by ~2e-4 (TF32 + reduction order)')
+    n.set_defaults(func=cmd_nll)
+
+    r = sub.add_parser('report', help='compare report numbers with the JSON records')
+    r.add_argument('--pdf', default='report/main.pdf')
+    r.set_defaults(func=cmd_report)
+
+    m = sub.add_parser('manifest', help='create or verify a SHA256 manifest')
+    m.add_argument('root', nargs='?', default='.')
+    m.add_argument('--out', default=None)
+    m.add_argument('--verify', action='store_true')
+    m.set_defaults(func=cmd_manifest)
+
+    a = ap.parse_args(argv)
+    rc = a.func(a)
+    sys.exit(rc or 0)
+
+
+if __name__ == '__main__':
+    main()
+\end{lstlisting}
+
+\subsection*{cs5494/compare\_runs.py --- side-by-side comparison of result folders}
+\begin{lstlisting}
+"""Compare several results folders (archived package vs GPU runs) side by side.
+
+Usage:
+    & 'D:\\HKStudy\\.venv\\Scripts\\python.exe' compare_runs.py
+    ... compare_runs.py --roots results
+    ... compare_runs.py --roots results/ablation_14x14 results
+
+Writes COMPARISON_5080_vs_ORIGINAL.md and comparisons/*.png. Only reads metrics.json,
+history.json, config.json and the saved PNGs, so it also works with the archived folder
+alone. Bits/pixel is used for the autoregressive models because it stays comparable when
+the image resolution changes between runs.
+"""
+import argparse, io, json
+from pathlib import Path
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+AR_RUNS = [('autoregressive', 'fvsbn', '60k'), ('autoregressive', 'made', '60k'),
+           ('ablation_10k', 'fvsbn', '10k'), ('ablation_10k', 'made', '10k')]
+LOSS_LABEL = {'fvsbn': 'train NLL (nats/image)', 'made': 'train NLL (nats/image)', 'gan': 'BCE'}
+
+
+def load_json(p, default=None):
+    p = Path(p)
+    if not p.exists():
+        return default
+    return json.loads(io.open(p, encoding='utf-8').read())
+
+
+def label_of(root):
+    s = str(root).replace('\\', '/')
+    if '_archive' in s:
+        return 'archive'
+    return Path(s).name
+
+
+def arch_of(root):
+    cfg = load_json(Path(root)/'autoregressive/config.json', {}) or {}
+    if not cfg:
+        return '?'
+    return f"{cfg.get('side', '?')}x{cfg.get('side', '?')}, {cfg.get('layers', 1)}x{cfg.get('hidden', '?')}"
+
+
+def grid_stats(png):
+    png = Path(png)
+    if not png.exists():
+        return None
+    a = np.asarray(Image.open(png).convert('L'), dtype=np.float32)/255.
+    h, w = a.shape
+    cell = h//10
+    t = np.stack([a[r*cell:(r+1)*cell, c*cell:(c+1)*cell].ravel() for r in range(10) for c in range(10)])
+    d = [float(np.linalg.norm(t[i]-t[j])) for i in range(len(t)) for j in range(i+1, len(t))]
+    return {'mean_ink': float(a.mean()), 'pairwise': float(np.mean(d))}
+
+
+def side_by_side(paths, titles, label, dst):
+    paths = [Path(p) for p in paths]
+    if not all(p.exists() for p in paths):
+        return None
+    try:
+        font = ImageFont.load_default(size=22)
+    except TypeError:
+        font = ImageFont.load_default()
+    ims = [Image.open(p).convert('RGB') for p in paths]
+    # Autoregressive grids are tiny at 14x14; scale everything to a comparable width
+    # with nearest neighbour so strokes stay crisp.
+    def _scale(im, target=560):
+        k = max(1, int(round(target/max(im.width, 1))))
+        return im.resize((im.width*k, im.height*k), Image.NEAREST)
+    ims = [_scale(im) for im in ims]
+    w = max(i.width for i in ims); pad = 54
+    canvas = Image.new('RGB', (w, sum(i.height for i in ims)+pad*len(ims)+8), 'white')
+    draw = ImageDraw.Draw(canvas)
+    y = 0
+    for title, im in zip(titles, ims):
+        draw.text((6, y+6), f'{label}  -  {title}', fill='black', font=font)
+        canvas.paste(im, ((w-im.width)//2, y+pad))
+        y += im.height+pad+8
+    dst = Path(dst); dst.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(dst)
+    return dst
+
+
+def plot_losses(curves, label, dst, name):
+    curves = [(t, h) for t, h in curves if h]
+    if len(curves) < 2:
+        return None
+    dst = Path(dst); dst.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(7.5, 3.6))
+    for title, h in curves:
+        plt.plot([r['epoch'] for r in h], [r['loss'] for r in h], label=title)
+        if name == 'gan':
+            plt.plot([r['epoch'] for r in h], [r.get('discriminator_loss', np.nan) for r in h],
+                     '--', alpha=.6, label=title+' D')
+    plt.xlabel('Epoch'); plt.ylabel(LOSS_LABEL[name]); plt.legend(fontsize=8); plt.title(label)
+    plt.tight_layout(); plt.savefig(dst, dpi=130); plt.close()
+    return dst
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--roots', nargs='+',
+                    default=['results'])
+    ap.add_argument('--out', default='COMPARISON_5080_vs_ORIGINAL.md')
+    ap.add_argument('--figures', default='comparisons')
+    ap.add_argument('--gan-eval', default='comparisons/gan_eval.json')
+    a = ap.parse_args()
+    roots = [Path(r) for r in a.roots if Path(r).exists()]
+    fig = Path(a.figures)
+    ev = load_json(a.gan_eval, {}) or {}
+    L = ['# Archived package vs GPU runs', '']
+    for r in roots:
+        L.append(f"- `{r.as_posix()}` - autoregressive images {arch_of(r)}")
+    L.append('')
+
+    # 1. autoregressive likelihood
+    L += ['## 1. Autoregressive test likelihood (bits/pixel, lower is better)', '',
+          'Bits/pixel is comparable across resolutions; nats/image are not, so they are shown in brackets.', '',
+          '| run | ' + ' | '.join(label_of(r) for r in roots) + ' |',
+          '|---|' + '---:|'*len(roots)]
+    for base, name, tag in AR_RUNS:
+        cells = []
+        for r in roots:
+            m = (load_json(r/base/'metrics.json', {}) or {}).get(name)
+            cells.append(f"{m['test_bits_per_pixel']:.4f} ({m['test_nll_nats_per_image']:.2f})" if m else 'n/a')
+        L.append(f'| {name} @ {tag} | ' + ' | '.join(cells) + ' |')
+    L.append('')
+
+    # 2. GAN
+    L += ['## 2. GAN variants', '',
+          'Scored with an independent CNN (accuracy on real test digits is reported below). '
+          'Real MNIST reference: confidence 0.939, class entropy 2.299 (max ln 10 = 2.303), FD 0. '
+          'FD is the Frechet distance between 128-d classifier features of 2000 generated and 5000 real images.', '',
+          '| run | arch | s/epoch | confidence | class entropy | FD (lower better) | classes |',
+          '|---|---|---:|---:|---:|---:|---:|']
+    for r in roots:
+        for d in sorted(p for p in r.iterdir() if p.is_dir() and p.name.startswith('gan')):
+            m = (load_json(d/'metrics.json', {}) or {}).get('gan')
+            cfg = load_json(d/'config.json', {}) or {}
+            if not m:
+                continue
+            st = (ev.get('runs', {}) or {}).get(d.as_posix(), {})
+            ep = cfg.get('epochs', 1)
+            L.append(f"| {label_of(r)}/{d.name} | {cfg.get('arch','mlp')} | "
+                     f"{m['training_and_preview_seconds']/ep:.2f} | {st.get('conf', float('nan')):.4f} | "
+                     f"{st.get('entropy', float('nan')):.4f} | {st.get('fd', float('nan')):.2f} | "
+                     f"{st.get('classes_used','n/a')} |")
+    if ev:
+        L += ['', f"Classifier test accuracy: {ev.get('classifier_test_acc',0):.4f}."]
+    L.append('')
+
+    # 3. speed
+    L += ['## 3. Speed per epoch (seconds, including preview generation)', '',
+          '| run | ' + ' | '.join(label_of(r) for r in roots) + ' |', '|---|' + '---:|'*len(roots)]
+    for base, name, tag in AR_RUNS[:2]:
+        cells = []
+        for r in roots:
+            m = (load_json(r/base/'metrics.json', {}) or {}).get(name)
+            cfg = load_json(r/base/'config.json', {}) or {}
+            cells.append(f"{m['training_and_preview_seconds']/cfg['epochs']:.3f}" if m and cfg else 'n/a')
+        L.append(f'| {name} training | ' + ' | '.join(cells) + ' |')
+    cells = []
+    for r in roots:
+        m = (load_json(r/'gan/metrics.json', {}) or {}).get('gan')
+        cfg = load_json(r/'gan/config.json', {}) or {}
+        cells.append(f"{m['training_and_preview_seconds']/cfg['epochs']:.3f}" if m and cfg else 'n/a')
+    L.append('| gan training | ' + ' | '.join(cells) + ' |')
+    L.append('')
+
+    # 4. figures
+    L += ['## 4. Figures', '']
+    for name in ('fvsbn', 'made'):
+        p = side_by_side([r/f'autoregressive/{name}/samples.png' for r in roots],
+                         [f'{label_of(r)} ({arch_of(r)})' for r in roots],
+                         f'{name} samples', fig/f'samples_{name}.png')
+        if p:
+            L += [f'![{name} samples]({p.as_posix()})', '']
+    gp = side_by_side([r/'gan/gan/samples.png' for r in roots],
+                      [f'{label_of(r)} ({(load_json(r/"gan/config.json", {}) or {}).get("arch","mlp")})' for r in roots],
+                      'gan samples', fig/'samples_gan.png')
+    if gp:
+        L += [f'![gan samples]({gp.as_posix()})', '']
+    for base, name, tag in AR_RUNS:
+        q = plot_losses([(label_of(r), load_json(r/base/name/'history.json', [])) for r in roots],
+                        f'{name} @ {tag} training loss', fig/f'loss_{name}_{tag}.png', name)
+        if q:
+            L += [f'![{name} @ {tag} loss]({q.as_posix()})', '']
+    q = plot_losses([(label_of(r), load_json(r/'gan/gan/history.json', [])) for r in roots],
+                    'gan training loss', fig/'loss_gan.png', 'gan')
+    if q:
+        L += [f'![gan loss]({q.as_posix()})', '']
+
+    # 5. verdict: best bits/pixel per model, and GAN scores
+    L += ['## 5. Verdict', '']
+    for base, name, tag in AR_RUNS:
+        vals = {}
+        for r in roots:
+            m = (load_json(r/base/'metrics.json', {}) or {}).get(name)
+            if m:
+                vals[label_of(r)] = m['test_bits_per_pixel']
+        if len(vals) > 1:
+            best = min(vals, key=vals.get)
+            first, last = list(vals)[0], list(vals)[-1]
+            L.append(f'- {name} @ {tag}: best is **{best}** ({vals[best]:.4f} bpp); '
+                     f'first -> last change {vals[last]-vals[first]:+.4f} bpp.')
+    conf = {}
+    for r in roots:
+        st = (ev.get('runs', {}) or {}).get((r/'gan').as_posix(), {})
+        if st:
+            conf[label_of(r)] = (st.get('fd', float('nan')), st.get('conf', 0), st.get('entropy', 0))
+    if len(conf) > 1:
+        best = min(conf, key=lambda k: conf[k][0])
+        L.append(f'- GAN: lowest FD is **{best}** (FD {conf[best][0]:.2f}); ' +
+                 ', '.join(f'{k} FD {v[0]:.2f} / conf {v[1]:.4f}' for k, v in conf.items()) + '.')
+    L += ['', 'Caveats: one seed per configuration; runs differ in training budget as well as architecture; '
+              'timings come from different machines (archived numbers are CPU).']
+
+    Path(a.out).write_text('\n'.join(L)+'\n', encoding='utf-8')
+    print('\n'.join(L))
+    print(f'\nwritten: {a.out}')
+
+
+if __name__ == '__main__':
+    main()
+\end{lstlisting}
+
+\subsection*{cs5494/sweep\_made.py --- MADE capacity and regularisation sweep}
+\begin{lstlisting}
+"""Small validation sweep for MADE capacity/regularisation on 28x28 binarised MNIST.
+
+Trains on 55,000 images and scores 5,000 held-out training images, so the choice of
+hyperparameters does not touch the 10,000-image test set (which is only read at the end
+of each run for reference). Writes sweep_made.csv.
+
+Usage:
+    & 'D:\\HKStudy\\.venv\\Scripts\\python.exe' sweep_made.py
+"""
+import json, io, subprocess, sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PY = sys.executable
+SUITES = {
+    1: [
+        ('h1024_l2_drop00', ['--hidden', '1024', '--layers', '2']),
+        ('h1024_l2_drop10', ['--hidden', '1024', '--layers', '2', '--dropout', '0.1']),
+        ('h1024_l2_drop20', ['--hidden', '1024', '--layers', '2', '--dropout', '0.2']),
+        ('h512_l1_drop00', ['--hidden', '512', '--layers', '1']),
+        ('h512_l1_drop10', ['--hidden', '512', '--layers', '1', '--dropout', '0.1']),
+        ('h1024_l2_drop10_wd1e4', ['--hidden', '1024', '--layers', '2', '--dropout', '0.1', '--weight-decay', '1e-4']),
+        ('h512_l2_drop10', ['--hidden', '512', '--layers', '2', '--dropout', '0.1']),
+    ],
+    # Round 2: pure L2 on the best capacity, plus cheaper 2-layer models.
+    2: [
+        ('h1024_l2_wd1e3', ['--hidden', '1024', '--layers', '2', '--weight-decay', '1e-3']),
+        ('h1024_l2_wd1e2', ['--hidden', '1024', '--layers', '2', '--weight-decay', '1e-2']),
+        ('h512_l2_drop00', ['--hidden', '512', '--layers', '2']),
+        ('h1024_l1_drop00', ['--hidden', '1024', '--layers', '1']),
+    ],
+    # Round 3: does the single-layer winner just need more epochs?
+    3: [('h1024_l1', ['--hidden', '1024', '--layers', '1'])],
+    # Round 4: wider single-layer models.
+    4: [('h1536_l1', ['--hidden', '1536', '--layers', '1']),
+        ('h2048_l1', ['--hidden', '2048', '--layers', '1'])],
+}
+import argparse
+_ap = argparse.ArgumentParser()
+_ap.add_argument('--suite', type=int, default=1, choices=sorted(SUITES))
+_ap.add_argument('--epochs', type=int, default=400)
+_a = _ap.parse_args()
+CONFIGS = SUITES[_a.suite]
+OUT = ROOT/('outputs_sweep' if _a.suite == 1 else f'outputs_sweep{_a.suite}')
+rows = []
+for tag, extra in CONFIGS:
+    target = OUT/tag
+    cmd = [PY, '-m', 'cs5494.train', '--models', 'made', '--samples', '60000', '--test-samples', '10000',
+           '--val', '5000', '--side', '28', '--epochs', str(_a.epochs), '--batch', '1024', '--lr', '0.001',
+           '--scheduler', 'cosine', '--device', 'cuda', '--workers', '4', '--output', str(target)] + extra
+    print('\n$', ' '.join(cmd), flush=True)
+    subprocess.run(cmd, cwd=ROOT, check=True)
+    m = json.loads(io.open(target/'metrics.json', encoding='utf-8').read())['made']
+    rows.append((tag, m['validation_bits_per_pixel'], m['test_bits_per_pixel'],
+                 m['training_and_preview_seconds']))
+    print(f'{tag:24s} val {m["validation_bits_per_pixel"]:.4f} bpp  test {m["test_bits_per_pixel"]:.4f} bpp', flush=True)
+
+rows.sort(key=lambda r: r[1])
+lines = ['config,val_bpp,test_bpp,train_seconds'] + [f'{t},{v:.4f},{te:.4f},{s:.0f}' for t, v, te, s in rows]
+(ROOT/('sweep_made.csv' if _a.suite == 1 else f'sweep_made{_a.suite}.csv')).write_text('\n'.join(lines)+'\n', encoding='utf-8')
+print('\n'.join(lines))
+\end{lstlisting}
+

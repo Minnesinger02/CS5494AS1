@@ -1,0 +1,7 @@
+{
+  "gan": {
+    "training_and_preview_seconds": 133.3561147999717,
+    "inference_100_seconds": 0.0003893000539392233,
+    "training_samples": 60000
+  }
+}

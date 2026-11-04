@@ -1,0 +1,53 @@
+{
+  "side": 28,
+  "test_samples": 10000,
+  "members": [
+    {
+      "run": "results/made_seed42",
+      "seed": 42,
+      "nats": 68.36487579345703,
+      "bpp": 0.1258031576871872,
+      "params": 2410768,
+      "inference_100_seconds": 0.3713796000229195
+    },
+    {
+      "run": "results/made_seed43",
+      "seed": 43,
+      "nats": 68.51276397705078,
+      "bpp": 0.12607529759407043,
+      "params": 2410768,
+      "inference_100_seconds": 0.0982932000188157
+    },
+    {
+      "run": "results/made_seed44",
+      "seed": 44,
+      "nats": 68.48590087890625,
+      "bpp": 0.12602585554122925,
+      "params": 2410768,
+      "inference_100_seconds": 0.09447759995236993
+    }
+  ],
+  "ensembles": [
+    {
+      "k": 2,
+      "members": [
+        "results/made_seed42",
+        "results/made_seed43"
+      ],
+      "nats": 67.0714111328125,
+      "bpp": 0.12342294926879262,
+      "params": 4821536
+    },
+    {
+      "k": 3,
+      "members": [
+        "results/made_seed42",
+        "results/made_seed43",
+        "results/made_seed44"
+      ],
+      "nats": 66.4638671875,
+      "bpp": 0.12230496376238387,
+      "params": 7232304
+    }
+  ]
+}

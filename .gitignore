@@ -1,0 +1,14 @@
+# Python byte code and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Archives produced by package.ps1
+*.zip
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store

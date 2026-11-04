@@ -1,0 +1,21 @@
+{
+  "models": [
+    "gan"
+  ],
+  "data": "data",
+  "output": "outputs_5080/gan",
+  "samples": 60000,
+  "test_samples": 10000,
+  "epochs": 150,
+  "batch": 256,
+  "side": 14,
+  "hidden": 512,
+  "lr": 0.00025,
+  "seed": 42,
+  "device": "cuda",
+  "lr_d": 0.0001,
+  "workers": 4,
+  "tf32": 1,
+  "resolved_device": "cuda",
+  "device_name": "NVIDIA GeForce RTX 5080"
+}

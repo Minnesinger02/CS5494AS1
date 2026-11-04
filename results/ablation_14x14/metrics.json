@@ -1,0 +1,16 @@
+{
+  "fvsbn": {
+    "training_and_preview_seconds": 17.0788440000033,
+    "inference_100_seconds": 0.017311333096586168,
+    "training_samples": 60000,
+    "test_nll_nats_per_image": 33.66151396484375,
+    "test_bits_per_pixel": 0.24777193503007483
+  },
+  "made": {
+    "training_and_preview_seconds": 42.64389683306217,
+    "inference_100_seconds": 0.07097783405333757,
+    "training_samples": 60000,
+    "test_nll_nats_per_image": 28.042872250366212,
+    "test_bits_per_pixel": 0.20641486085656155
+  }
+}

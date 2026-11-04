@@ -1,0 +1,20 @@
+Resolved 15 packages in 895ms
+Downloading reportlab (1.9MiB)
+Downloading onnxruntime (19.9MiB)
+Downloading pymupdf (64.0MiB)
+ Downloaded reportlab
+ Downloaded onnxruntime
+ Downloaded pymupdf
+Prepared 10 packages in 5.84s
+Installed 11 packages in 17ms
+ + charset-normalizer==3.5.2
+ + flatbuffers==25.12.19
+ + onnxruntime==1.31.1
+ + protobuf==7.36.2
+ + psutil==7.2.2
+ + pymupdf==2.0
+ + pymupdf-layout==2.0
+ + pymupdf4llm==2.0
+ + pyyaml==6.0.3
+ + reportlab==5.1.0
+ + tabulate==0.10.0

@@ -1,0 +1,17 @@
+{
+  "models": [
+    "gan"
+  ],
+  "data": "data",
+  "output": "outputs/gan",
+  "samples": 60000,
+  "test_samples": 10000,
+  "epochs": 60,
+  "batch": 128,
+  "side": 14,
+  "hidden": 512,
+  "lr": 0.0002,
+  "seed": 42,
+  "device": "cpu",
+  "resolved_device": "cpu"
+}

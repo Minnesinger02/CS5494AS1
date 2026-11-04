@@ -1,0 +1,53 @@
+{
+  "side": 28,
+  "test_samples": 10000,
+  "members": [
+    {
+      "run": "results/made10k_seed42",
+      "seed": 42,
+      "nats": 80.0947036743164,
+      "bpp": 0.1473880559206009,
+      "params": 2410768,
+      "inference_100_seconds": 0.367525800014846
+    },
+    {
+      "run": "results/made10k_seed43",
+      "seed": 43,
+      "nats": 80.13703918457031,
+      "bpp": 0.14746595919132233,
+      "params": 2410768,
+      "inference_100_seconds": 0.09639710001647472
+    },
+    {
+      "run": "results/made10k_seed44",
+      "seed": 44,
+      "nats": 80.33197021484375,
+      "bpp": 0.14782467484474182,
+      "params": 2410768,
+      "inference_100_seconds": 0.09680459997616708
+    }
+  ],
+  "ensembles": [
+    {
+      "k": 2,
+      "members": [
+        "results/made10k_seed42",
+        "results/made10k_seed43"
+      ],
+      "nats": 77.85929107666016,
+      "bpp": 0.1432745065349846,
+      "params": 4821536
+    },
+    {
+      "k": 3,
+      "members": [
+        "results/made10k_seed42",
+        "results/made10k_seed43",
+        "results/made10k_seed44"
+      ],
+      "nats": 76.91523742675781,
+      "bpp": 0.14153728520966924,
+      "params": 7232304
+    }
+  ]
+}

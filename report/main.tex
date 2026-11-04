@@ -1,0 +1,728 @@
+% CS5494 Assignment report
+% Typography follows the CityUHK thesis template conventions (XeLaTeX, Times New Roman,
+% A4, plain page style with centred page numbers, black hyperlinks).
+\documentclass[11pt,a4paper]{article}
+
+\usepackage{fontspec}
+\setmainfont{Times New Roman}
+% SimSun is used only for the Chinese form of the author name on the title page; Times New Roman
+% has no CJK glyphs. Remove this line and the {\zhfont ...} group below for a Latin-only name.
+\newfontfamily\zhfont{SimSun}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage[backend=biber,style=authoryear,maxcitenames=2]{biblatex}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=black,urlcolor=black]{hyperref}
+\usepackage{fancyhdr}
+\usepackage{siunitx}
+\usepackage{listings}
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\scriptsize,
+  breaklines=true,
+  breakatwhitespace=false,
+  showstringspaces=false,
+  tabsize=4,
+  columns=flexible,
+  keepspaces=true
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0pt}
+
+\clubpenalty10000
+\widowpenalty10000
+\captionsetup{font=small,labelfont=bf}
+\setlist{itemsep=2pt,topsep=3pt}
+\sisetup{detect-weight=true,group-separator={,}}
+
+\addbibresource{refs.bib}
+
+\newcommand{\outputs}{\texttt{outputs\_final}}
+
+\title{\bfseries Autoregressive and Adversarial Generative Models for MNIST}
+\author{Name: {\zhfont 刘纳多} (LIU Naduo) \quad Student ID: 60777841\\
+\small Code and data (GitHub, public): \url{https://github.com/Minnesinger02/CS5494AS1}}
+\date{CS5494 Topics in Generative AI --- Assignment, November 2026\\[2pt]
+\small Training data: the entire 60{,}000-image MNIST training set
+(binarised for FVSBN and MADE; grayscale for the GAN)}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This report implements the three generators required by the assignment: a fully visible
+sigmoid belief network, a neural autoregressive model, and a generative adversarial network
+on MNIST. All autoregressive models are trained on $28\times28$ binarised digits and evaluated
+by exact held-out likelihood, reported both as nats per image and as bits per pixel so that
+results at different resolutions remain comparable. The generative adversarial network is
+trained on the original grayscale digits and evaluated with an independent classifier.
+Beyond the baseline implementations we report a validation-based hyperparameter study of the
+autoregressive model, a three-member mixture of autoregressive models, a convolutional
+adversarial architecture with a two-timescale update rule, and an exponential moving average
+of the generator weights. The final autoregressive model reaches $0.1223$ bits per pixel as a
+three-member mixture ($0.1260$ for a single model), and the convolutional generator reaches a
+feature-Fr\'echet distance of 7.12 against 34.61 for the initial fully connected baseline.
+\end{abstract}
+
+\newpage
+\tableofcontents
+\newpage
+%----------------------------------------------------------------------------------------
+\section{Introduction}
+%----------------------------------------------------------------------------------------
+
+The assignment asks for three separate image generators on MNIST~\parencite{mnist1998}.
+Section~1.1 requires a \emph{fully visible} sigmoid belief network, that is, a model with no
+latent or hidden variables whose conditionals are logistic; Section~1.2 requires a
+\emph{neural} autoregressive model with one or more layers; Section~1.3 requires a generative
+adversarial network trained on the original, non-binarised digits, together with a short
+discussion of training stability.
+The two autoregressive models are trained on binarised digits, the generative adversarial
+network on grayscale digits, and each model is evaluated on the metric that its formulation
+supports: exact likelihood for the autoregressive models and a classifier-based distribution
+distance for the adversarial one.
+
+The report makes four additions to a straightforward implementation.
+First, the autoregressive inputs use the full $28\times28$ resolution rather than a reduced
+grid, which lowers the cost per pixel by roughly a factor of two even though the total
+per-image likelihood rises.
+Second, the capacity, depth and regularisation of the autoregressive network were selected on
+a held-out slice of the \emph{training} set, so the test set is read only once.
+Third, three independently seeded autoregressive models are combined into a mixture, and the
+effect of the mixture size is measured rather than assumed.
+Fourth, the adversarial model is first trained as a fully connected baseline, then as a
+convolutional network with a two-timescale update rule, and finally with an exponential moving
+average of the generator weights; each change is reported with the same three external
+statistics, which makes the improvement traceable rather than anecdotal.
+
+%----------------------------------------------------------------------------------------
+\section{Data and preprocessing}
+%----------------------------------------------------------------------------------------
+
+MNIST contains 60{,}000 training and 10{,}000 test images of size $28\times28$ with pixel
+intensities $v\in\{0,\dots,255\}$.
+For the two autoregressive models the digits are binarised with a fixed threshold,
+\begin{equation}
+  x_{ij} = \mathbf{1}\left[\frac{v_{ij}}{255} \ge 0.5\right],
+  \label{eq:binarise}
+\end{equation}
+which yields a mean ink coverage of $13.2\%$ over the training set; a pixel is therefore much
+more likely to be background than stroke, and a model that only predicts the marginal
+distribution already reaches $0.5636$ bits per pixel.
+No resizing is applied, so the autoregressive input is a $784$-dimensional binary vector in
+raster order. A $14\times14$ variant with the same threshold is included as a resolution
+reference in Section~\ref{sec:discussion} and stored under \texttt{results/ablation\_14x14}.
+For the generative adversarial network the digits keep their grayscale values and are scaled
+to $[-1,1]$, which matches the $\tanh$ output of the generator.
+
+The training subset is drawn once with \texttt{torch.randperm} under seed~42 and stored with
+each run, so every experiment that uses the same number of images sees exactly the same
+digits. The $10{,}000$-image ablation reuses the first $10{,}000$ entries of that permutation.
+Hyperparameter selection used a further split of $5{,}000$ images taken from the \emph{front}
+of the training subset; those images were never used for gradient updates while tuning, and
+the final models are retrained on all $60{,}000$ images with the selected settings.
+The test set is used exclusively for the numbers reported in Section~\ref{sec:experiments}.
+
+%----------------------------------------------------------------------------------------
+\section{Methods}
+%----------------------------------------------------------------------------------------
+
+\subsection{Fully visible sigmoid belief network}
+\label{sec:fvsbn}
+
+The fully visible sigmoid belief network factorises the joint distribution into one logistic
+conditional per pixel,
+\begin{equation}
+  p(\mathbf{x}) = \prod_{i=1}^{D} p(x_i \mid x_{1},\dots,x_{i-1}),
+  \qquad
+  p(x_i=1\mid \mathbf{x}_{<i}) = \sigma\!\left(b_i + \sum_{j<i} W_{ij} x_j\right),
+  \label{eq:fvsbn}
+\end{equation}
+with $D=784$ pixels in raster order and $\sigma$ the logistic function.
+Because there are no hidden units, the model is exactly a chain of logistic regressions.
+Causality is enforced structurally: the weight matrix is multiplied elementwise by a mask
+\begin{equation}
+  M_{ij} = \mathbf{1}[\,j < i\,],
+\end{equation}
+so output $i$ can never receive information from pixel $i$ or from any later pixel.
+Training minimises the negative log-likelihood of the training set,
+\begin{equation}
+  \mathcal{L}(\mathbf{x}) = -\sum_{i=1}^{D} \Big[ x_i \log \sigma(z_i) + (1-x_i)\log\big(1-\sigma(z_i)\big)\Big],
+  \label{eq:nll}
+\end{equation}
+which is the sum of the $784$ per-pixel binary cross entropies; this is also the quantity
+reported as nats per image.
+Sampling starts from an empty canvas and draws one pixel at a time in raster order, using the
+model's own predictions as the conditioning context.
+
+\subsection{Neural autoregressive model}
+\label{sec:made}
+
+The second model keeps the same factorisation but replaces the logistic conditional with a
+masked multilayer network, following the masked autoencoder for distribution
+estimation~\parencite{made2015}. Every input pixel, every hidden unit and every output unit is
+assigned a \emph{degree}; information may only flow from lower to higher degrees.
+With input degrees $d^{\text{in}}_j=j$ and hidden degrees $d^{\text{hid}}_k = k \bmod (D-1)$,
+the three masked layers satisfy
+\begin{equation}
+  d^{\text{in}}_j \le d^{\text{hid}}_k,
+  \qquad
+  d^{\text{hid}}_k \le d^{\text{hid}}_{k'},
+  \qquad
+  d^{\text{hid}}_k < d^{\text{out}}_i,
+  \label{eq:made-masks}
+\end{equation}
+where the middle condition applies between consecutive hidden layers.
+Any path from an input pixel to output $i$ is a chain of non-decreasing degrees that ends with
+a strict inequality, hence it can only start at a pixel $j<i$; output $i$ therefore never
+depends on the current or a future pixel.
+The implementation uses one hidden layer of $1536$ rectified linear units, which gives about
+$2.41$ million parameters, and the same summed binary cross entropy as in
+Equation~\ref{eq:nll}.
+Sampling is sequential as well: $784$ forward passes per image, which is why the measured
+sampling time is two orders of magnitude larger than for the adversarial generator.
+
+\subsubsection{Mixtures of autoregressive models}
+
+Independent runs of the same architecture differ in initialisation and in the order in which
+mini-batches are presented, and their errors are only partly correlated.
+A mixture of $K$ models is itself a normalised density,
+\begin{equation}
+  p_{\text{mix}}(\mathbf{x}) = \frac{1}{K}\sum_{k=1}^{K} p_k(\mathbf{x}),
+  \qquad
+  \log p_{\text{mix}}(\mathbf{x}) = \operatorname{logsumexp}_k \log p_k(\mathbf{x}) - \log K,
+  \label{eq:mixture}
+\end{equation}
+so its held-out likelihood can be compared directly with a single model.
+Averaging the logits and applying a sigmoid would instead produce a geometric mean, which is
+not normalised and therefore not a valid likelihood; that shortcut is deliberately not used.
+The practical cost is linear in $K$: $K$ times the parameters, $K$ times the evaluation time,
+and no closed-form way of sampling from the mixture of autoregressive models, so generated
+images are drawn from one member and this is stated wherever such images appear.
+
+\subsection{Generative adversarial network}
+\label{sec:gan}
+
+The generator maps a $64$-dimensional standard normal vector to an image and the discriminator
+maps an image to a single logit; both are trained with the non-saturating objective of
+\parencite{gan2014},
+\begin{equation}
+  \min_G \max_D \; \mathbb{E}_{\mathbf{x}\sim p_{\text{data}}}\big[\log D(\mathbf{x})\big]
+  + \mathbb{E}_{\mathbf{z}}\big[\log\big(1-D(G(\mathbf{z}))\big)\big].
+  \label{eq:gan}
+\end{equation}
+Each mini-batch performs one discriminator step on real and detached fake images, followed by
+one generator step.
+
+\subsubsection{Fully connected baseline}
+
+The first architecture follows the same spirit as the original formulation: the generator maps
+$64\to256\to512\to784$ with leaky ReLU slopes of $0.2$ and a $\tanh$ output, and the
+discriminator maps $784\to512\to256\to1$.
+It is simple to train but has no notion of locality, and its samples are visibly noisier than
+the convolutional ones (Section~\ref{sec:gan-results}).
+
+\subsubsection{Convolutional architecture}
+
+The second architecture is a DCGAN-style pair~\parencite{dcgan2016}. The generator projects
+the latent vector to $128\times7\times7$, applies batch normalisation~\parencite{bn2015} and
+two $4\times4$ transposed convolutions with stride $2$, reaching $28\times28$ with a $\tanh$
+output. The discriminator mirrors this with two strided $4\times4$ convolutions and a linear
+logit. Batch normalisation stabilises both players but also makes the discriminator's
+statistics depend on the batch, which interacts with the learning-rate choice below.
+
+\subsubsection{Two-timescale update rule}
+
+With mini-batches of $512$ images the discriminator receives a comparatively low-variance
+gradient estimate, so at a shared learning rate it overtakes the generator within a few epochs
+and the generator loss drifts upwards. Following the two-timescale update
+rule~\parencite{ttur2017} we keep the generator at $2\times10^{-4}$ and lower the
+discriminator to $2\times10^{-5}$. The effect is large and is measured rather than asserted:
+with the shared rate the same architecture reaches a feature distance of $38.30$, whereas the
+two-timescale version reaches $7.71$ with the fully connected pair and $7.15$ with the
+convolutional pair (Table~\ref{tab:gan}).
+
+\subsubsection{Exponential moving average of the generator}
+
+Adversarial training does not minimise a fixed objective, so the generator oscillates around
+the equilibrium and the last iterate is not necessarily the best one. We therefore keep a
+shadow copy of the generator parameters,
+\begin{equation}
+  \theta_{\text{ema}} \leftarrow d\,\theta_{\text{ema}} + (1-d)\,\theta,
+  \qquad d = 0.999,
+  \label{eq:ema}
+\end{equation}
+updated after every generator step. Only floating-point parameters are averaged; the batch
+normalisation running statistics are copied from the live model when the checkpoint is written,
+because averaging them would mix statistics from different weight configurations.
+The average is used only for sampling: training, previews and the reported loss curves all use
+the live weights, so the training curves remain comparable with the run without averaging.
+The checkpoint is stored alongside the conventional one, which allows the two to be evaluated
+under identical conditions.
+
+\subsection{Evaluation protocol}
+\label{sec:metrics}
+
+The autoregressive models are scored by the negative log-likelihood of the $10{,}000$ test
+images, in nats per image, and converted to bits per pixel,
+\begin{equation}
+  \text{bpp} = \frac{\text{NLL}}{D \ln 2},
+  \label{eq:bpp}
+\end{equation}
+with $D=784$. The conversion matters because nats per image grows with the number of pixels:
+a $14\times14$ model with $33.66$ nats is worse per pixel ($0.2478$ bpp) than a $28\times28$
+model with $68.59$ nats ($0.1262$ bpp). All cross-resolution statements in this report use
+bits per pixel.
+
+The adversarial generator has no tractable likelihood, so it is scored with an independent
+convolutional classifier trained on real MNIST (test accuracy $96.4\%$). Three statistics are
+reported: the mean maximum class probability (confidence), the entropy of the predicted-class
+histogram over $2{,}000$ samples (maximum $\ln 10 = 2.303$), and a Fr\'echet distance between
+the $128$-dimensional penultimate features of $2{,}000$ generated and $5{,}000$ real images,
+\begin{equation}
+  \mathrm{FD} = \lVert \mu_g - \mu_r \rVert^2 + \operatorname{tr}\!\left(\Sigma_g + \Sigma_r - 2(\Sigma_g\Sigma_r)^{1/2}\right).
+  \label{eq:fd}
+\end{equation}
+Real MNIST scores confidence $0.939$, entropy $2.299$ and $\mathrm{FD}=0$ by construction; a
+self-comparison of two real batches gives $\mathrm{FD}=0.02$, which indicates the numerical
+noise floor. The measure is a proxy, not the standard FID, and differences below about one
+unit should not be treated as meaningful with $2{,}000$ samples.
+
+The same classifier serves as the labelling device for every sample figure in this report.
+Because all generators are unconditional, $4{,}000$ unconditional samples are drawn per model,
+labelled by the classifier, and the first ten samples assigned to each digit are kept.
+Columns of those figures therefore correspond to the digits $0,1,\dots,9$ and every row is an
+independent draw, so a column shows ten different attempts at the same digit.
+Selection is by predicted class only --- samples are neither ranked by confidence nor chosen
+for appearance --- and the number of candidates needed is reported in
+Section~\ref{sec:digits}.
+
+%----------------------------------------------------------------------------------------
+\section{Experiments}
+\label{sec:experiments}
+%----------------------------------------------------------------------------------------
+
+\subsection{Setup}
+
+Table~\ref{tab:setup} lists the configuration of the reported runs. Every run uses seed~42
+for data selection, and the three mixture members differ only in the seed used for weight
+initialisation and batch order.
+
+\begin{table}[H]
+\centering
+\caption{Configuration of the reported runs. The two autoregressive families share the
+optimiser and schedule; the adversarial models use the DCGAN betas.}
+\label{tab:setup}
+\small
+\begin{tabular}{llll}
+\toprule
+ & FVSBN & MADE & DCGAN \\
+\midrule
+Input & $28\times28$ binary & $28\times28$ binary & $28\times28$ grayscale in $[-1,1]$ \\
+Epochs & 400 & 400 & 400 \\
+Batch size & 1024 & 1024 & 512 \\
+Learning rate & $10^{-3}$ + cosine & $10^{-3}$ + cosine & $2\times10^{-4}$ (G), $2\times10^{-5}$ (D) \\
+Adam betas & $(0.9,0.999)$ & $(0.9,0.999)$ & $(0.5,0.999)$ \\
+Parameters & 0.62 M & 2.41 M & 0.54 M (G) + 0.14 M (D) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Autoregressive models}
+\label{sec:ar-results}
+
+\begin{table}[H]
+\centering
+\caption{Test likelihood on all $10{,}000$ MNIST digits. Bits per pixel is comparable across
+resolutions; nats per image is not. The mixture rows combine independently seeded MADE
+models with Equation~\ref{eq:mixture}; their parameter count and evaluation cost grow with $K$.}
+\label{tab:ar}
+\small
+\begin{tabular}{lrrrrrr}
+\toprule
+Model & Train $n$ & Test NLL & bits/px & Train (s) & 100 samples (s) & Params \\
+\midrule
+FVSBN & 60{,}000 & 75.72 & 0.1393 & 47.4 & 0.064 & 0.62 M \\
+MADE, single (mean of 3 seeds) & 60{,}000 & $68.45 \pm 0.08$ & 0.1260 & 52.1 & 0.100 & 2.41 M \\
+MADE mixture, $K=2$ & 60{,}000 & 67.07 & 0.1234 & --- & 0.100 & 4.82 M \\
+MADE mixture, $K=3$ & 60{,}000 & \textbf{66.46} & \textbf{0.1223} & --- & 0.100 & 7.23 M \\
+\midrule
+FVSBN & 10{,}000 & 120.17 & 0.2211 & 12.7 & 0.071 & 0.62 M \\
+MADE, single (mean of 3 seeds) & 10{,}000 & $80.19 \pm 0.13$ & 0.1476 & 13.9 & 0.102 & 2.41 M \\
+MADE mixture, $K=3$ & 10{,}000 & 76.92 & 0.1415 & --- & 0.102 & 7.23 M \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ar} and Figures~\ref{fig:fvsbn}--\ref{fig:made} summarise the autoregressive
+results; in both figures the samples are grouped by the digit predicted by the classifier,
+following the convention of Section~\ref{sec:metrics}. Three observations stand out.
+
+\emph{The linear model is a strong baseline.} With $784$ inputs the strictly lower-triangular
+logistic model reaches $0.1393$ bits per pixel, which is already $4.0$ times better than the
+marginal-distribution baseline ($0.5636$ bpp). Most of the remaining structure at this
+resolution is therefore additive in earlier pixels.
+
+\emph{The nonlinear model still wins.} MADE reduces the cost to $0.1260$ bits per pixel, a
+$9.5\%$ relative reduction, and the visible difference in
+Figures~\ref{fig:fvsbn}--\ref{fig:made} is consistent with the number: the linear samples are
+fragmented, whereas the masked network produces continuous strokes.
+Figure~\ref{fig:made} also shows that the model is not perfectly calibrated at the level of
+individual digits, but strokes are connected.
+
+\emph{The mixture helps and is measurable.} Going from one to three members lowers the test
+likelihood from $68.45$ to $66.46$ nats ($2.9\%$), and the gain from $K=1$ to $K=2$ is already
+two thirds of the total (Figure~\ref{fig:ensemble}). Because the members are trained
+independently, this gain is a genuine variance reduction rather than a longer training
+schedule; the price is three times the parameters and three times the evaluation cost, while
+sampling still uses a single member.
+
+Every mixture member reproduces to within $0.01$ nats from its saved weights when the
+likelihood is recomputed on the CPU; the residual is consistent with TF32 accumulation
+order, and the same check on a CPU-trained model reproduces to $10^{-7}$.
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.46\textwidth}
+  \includegraphics[width=\linewidth]{figures/digits_fvsbn.png}
+  \caption{Samples grouped by predicted digit: columns $0\dots9$, ten draws per column.}
+\end{subfigure}\hfill
+\begin{subfigure}{0.40\textwidth}
+  \includegraphics[width=\linewidth]{figures/fvsbn_progress.png}
+  \caption{Training stages 1, 101, 201, 301 and 400 (one stage per row).}
+\end{subfigure}
+
+\vspace{2pt}
+\includegraphics[width=0.52\linewidth]{figures/fvsbn_loss.png}
+\caption{FVSBN: samples, training progress and training negative log-likelihood.}
+\label{fig:fvsbn}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.46\textwidth}
+  \includegraphics[width=\linewidth]{figures/digits_made.png}
+  \caption{Samples grouped by predicted digit, same layout as Figure~\ref{fig:fvsbn}.}
+\end{subfigure}\hfill
+\begin{subfigure}{0.40\textwidth}
+  \includegraphics[width=\linewidth]{figures/made_progress.png}
+  \caption{Training stages, same rows as Figure~\ref{fig:fvsbn}.}
+\end{subfigure}
+
+\vspace{2pt}
+\includegraphics[width=0.52\linewidth]{figures/made_loss.png}
+\caption{MADE: samples, training progress and training negative log-likelihood.}
+\label{fig:made}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.52\linewidth]{figures/ensemble_ablation.png}
+\caption{Test bits per pixel of the MADE mixture as a function of the number of members $K$
+on the same $10{,}000$ test images.}
+\label{fig:ensemble}
+\end{figure}
+
+\subsection{Adversarial models}
+\label{sec:gan-results}
+
+\begin{table}[H]
+\centering
+\caption{Generative adversarial models, scored with an independent classifier. Confidence and
+entropy are computed from $2{,}000$ samples; FD is a feature Fr\'echet distance to $5{,}000$
+real images (lower is better). Real MNIST: $0.939$ / $2.299$ / $0$.}
+\label{tab:gan}
+\small
+\begin{tabular}{llrrrrr}
+\toprule
+Model & Architecture & Epochs & Confidence & Entropy & FD & s/epoch \\
+\midrule
+MLP, initial run & fully connected & 60 & 0.8802 & 2.1737 & 34.61 & 5.29 \\
+MLP, shared learning rate & fully connected & 150 & 0.8787 & 2.1655 & 38.30 & 0.89 \\
+MLP, two-timescale & fully connected & 150 & \textbf{0.8852} & 2.2808 & 7.71 & 0.90 \\
+DCGAN, live weights & convolutional & 400 & 0.8477 & 2.2735 & 7.15 & 0.80 \\
+DCGAN, moving average & convolutional & 400 & 0.8476 & 2.2740 & \textbf{7.12} & 0.80 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:mlp} shows the fully connected baseline and Figure~\ref{fig:dcgan} the
+convolutional model; the appendix compares the three fully connected runs side by side.
+The first row of Table~\ref{tab:gan} is an initial run with a single learning rate at a batch
+size of $128$. Increasing the batch while keeping that rate made the discriminator dominant
+and raised the feature distance to $38.30$, which is the empirical reason for adopting the
+two-timescale rule. With the rule, the same architecture reaches
+$7.71$, and the convolutional architecture reaches $7.15$ with visibly smoother strokes.
+
+All five runs cover the ten digits, contain no blank images and produce class histograms
+without a dominant class, so there is no complete mode collapse. The smallest predicted-class
+share in $2{,}000$ samples is $3.5\%$ for the initial run and $6.2\%$ for the convolutional
+one, while the largest is $19.3\%$ and $15.5\%$ respectively, so coverage is uneven rather
+than absent: 9 and 8 are drawn more often than 4 and 5, and the gap is visible in the digit
+columns of Figures~\ref{fig:mlp}--\ref{fig:dcgan}.
+
+The generator and discriminator losses of the convolutional run stay in a narrow band --- about
+$0.93$ and $1.12$ at the end of training --- which is the oscillation expected around the
+adversarial equilibrium rather than evidence of convergence; the loss panel of
+Figure~\ref{fig:dcgan} shows the same behaviour over all 400 epochs.
+
+Using the moving average changes the checkpoint only; the training curve and the loss values
+are identical to the live-weight run. The three external statistics are also almost identical:
+confidence $0.8476$ against $0.8477$, entropy $2.2740$ against $2.2735$, and
+$\mathrm{FD}=7.12$ against $7.15$. A difference of $0.03$ is far below the run-to-run spread of
+this architecture, since two runs of the same configuration differ by $0.14$ in FD
+($7.15$ and $7.29$ for two such runs) because cuDNN convolution kernels are not
+bit-reproducible. The moving average is therefore reported as a stabilising option that costs
+nothing at inference, not as a demonstrated quality gain; the sample grid is included so the
+reader can judge the visual difference independently.
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.46\textwidth}
+  \includegraphics[width=\linewidth]{figures/digits_mlp.png}
+  \caption{Samples grouped by predicted digit.}
+\end{subfigure}\hfill
+\begin{subfigure}{0.40\textwidth}
+  \includegraphics[width=\linewidth]{figures/mlp_progress.png}
+  \caption{Training stages with four fixed latent vectors per row.}
+\end{subfigure}
+
+\vspace{2pt}
+\includegraphics[width=0.52\linewidth]{figures/mlp_loss.png}
+\caption{Fully connected baseline trained with the two-timescale rule.}
+\label{fig:mlp}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\begin{subfigure}{0.46\textwidth}
+  \includegraphics[width=\linewidth]{figures/digits_dcgan_raw.png}
+  \caption{Live weights.}
+\end{subfigure}\hfill
+\begin{subfigure}{0.46\textwidth}
+  \includegraphics[width=\linewidth]{figures/digits_dcgan_ema.png}
+  \caption{Moving average.}
+\end{subfigure}
+
+\vspace{2pt}
+\begin{subfigure}{0.30\textwidth}
+  \includegraphics[width=\linewidth]{figures/dcgan_progress.png}
+  \caption{Training stages.}
+\end{subfigure}\hfill
+\begin{subfigure}{0.45\textwidth}
+  \includegraphics[width=\linewidth]{figures/dcgan_loss.png}
+  \caption{Generator and discriminator loss.}
+\end{subfigure}
+\caption{Convolutional generator: samples grouped by predicted digit for the live weights and
+for the moving average, the training-stage grid and the adversarial losses.}
+\label{fig:dcgan}
+\end{figure}
+
+\subsection{Hyperparameter analysis}
+\label{sec:hyper}
+
+\begin{table}[H]
+\centering
+\caption{Masked autoregressive configurations. Selection used $5{,}000$ images held out of the
+training split; the test column is shown only for reference and did not guide the choice.}
+\label{tab:sweep}
+\small
+\begin{tabular}{lrrr}
+\toprule
+Configuration & Validation bpp & Test bpp & Train (s) \\
+\midrule
+1536 units, 1 layer, 400 epochs & \textbf{0.1287} & 0.1266 & 44 \\
+2048 units, 1 layer, 400 epochs & 0.1295 & 0.1276 & 44 \\
+1024 units, 1 layer, 400 epochs & 0.1320 & 0.1296 & 69 \\
+1024 units, 1 layer, 800 epochs & 0.1341 & 0.1318 & 86 \\
+1024 units, 2 layers, weight decay $10^{-3}$ & 0.1376 & 0.1349 & 64 \\
+1024 units, 2 layers, 400 epochs & 0.1443 & 0.1416 & 47 \\
+1024 units, 2 layers, weight decay $10^{-2}$ & 0.1450 & 0.1419 & 75 \\
+1024 units, 2 layers, dropout $0.1$ & 0.1469 & 0.1438 & 49 \\
+512 units, 1 layer, 400 epochs & 0.1618 & 0.1589 & 45 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:sweep} reports the nine most informative of fourteen configurations that were
+trained for this study. Three findings shaped the final model.
+
+A single wide layer is consistently better than two narrower ones: at $1024$ units the
+validation cost is $0.1320$ against $0.1443$ bits per pixel. With the mask conditions of
+Equation~\ref{eq:made-masks}, every additional masked layer restricts the set of admissible
+paths, so depth buys little here and costs optimisation difficulty.
+Dropout and weight decay did not help at this data size, which suggests that the gap between
+training and test likelihood is not the binding constraint.
+Doubling the number of epochs from $400$ to $800$ made the validation cost worse
+($0.1320 \to 0.1341$), so the cosine schedule at $400$ epochs was kept.
+
+\subsection{Per-digit showcase}
+\label{sec:digits}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\linewidth]{figures/digit_grid.png}
+\caption{Unconditional samples grouped by the digit predicted by the independent classifier,
+shown side by side for the linear model, the masked autoregressive model and the convolutional
+generator. Columns are $0,1,\dots,9$; each row is an independent draw. The same convention is
+used in Figures~\ref{fig:fvsbn}--\ref{fig:dcgan}.}
+\label{fig:digits}
+\end{figure}
+
+The generators are unconditional and have no class input, so a digit-ordered grid cannot be
+produced by conditioning. As described in Section~\ref{sec:metrics}, $4{,}000$ unconditional
+samples are drawn per model, labelled by the classifier, and the first ten assigned to each
+digit are kept; samples are not ranked by confidence and are not selected for appearance.
+The pool size is reported because it shows that the selection does not hide a collapse: the
+rarest predicted class contains $52$ of $4{,}000$ draws for the linear model but $249$ for
+MADE and $243$ for the convolutional generator with the moving average.
+
+\subsection{Run time}
+
+Training and sampling times are listed in Table~\ref{tab:ar} for the autoregressive models and
+Table~\ref{tab:gan} for the adversarial ones. The full pipeline on one RTX~5080 laptop GPU
+--- three mixture members at $60{,}000$ images, their $10{,}000$-image counterparts, one
+adversarial model, sampling, evaluation and the digit grid --- takes about ten minutes, of
+which the adversarial model accounts for roughly $60\%$.
+Autoregressive sampling is the slowest inference path because it performs $784$ sequential
+forward passes, but a batch of $100$ images still completes in about $0.1$~s.
+
+%----------------------------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+%----------------------------------------------------------------------------------------
+
+\paragraph{Resolution.}
+The $14\times14$ ablation shows why bits per pixel is the right unit. The $14\times14$ model reaches $33.66$ nats per image, the $28\times28$ model
+$68.45$; the first looks better until the pixel count is accounted for, at which point the
+full-resolution model is twice as efficient per pixel. The apparent paradox comes from
+area-downsampling: averaging four pixels and thresholding produces a denser, less predictable
+binary image, so each coarse pixel carries more entropy than each fine pixel.
+
+\paragraph{Linear versus nonlinear.}
+At $28\times28$ the linear model is only $9.5\%$ worse than the masked network, while at
+$14\times14$ the gap was $17\%$. The nonlinear model therefore helps most where the binary
+resolution destroys information; at full resolution a large part of the remaining structure is
+still additive. This also explains why the mixture, rather than a larger network, was the
+cheapest way to improve the likelihood: widening from $1536$ to $2048$ units did nothing,
+while averaging three independently trained models removed $2$ nats.
+
+\paragraph{Adversarial stability.}
+The three adversarial runs illustrate the interaction between batch size and learning rate.
+The initial run used $128$-image batches with a shared rate and converged slowly but stably.
+Moving to $512$-image batches without changing the rate reduced the noise in the discriminator
+gradient enough for it to dominate, and the measured distribution distance degraded beyond the
+initial run. Halving the discriminator rate restored balance, and the convolutional architecture
+then improved the distance further while producing smoother strokes. The moving average is a
+cheap additional stabiliser: it does not change training, only which weights are used at
+sampling time.
+Class histograms show no collapse, but the imbalance between frequent (9, 8) and rare (4, 5)
+shapes persists in every run, so coverage is uneven rather than absent.
+
+\paragraph{Limitations.}
+All results are single-seed except the autoregressive mixture, so no significance test is
+offered for the adversarial comparisons; the mixture spread ($\pm0.08$ nats) is reported as a
+rough guide to seed noise. The Fr\'echet distance uses a classifier trained on MNIST rather
+than an external feature extractor, so it is a proxy and is treated as such. The binarisation
+threshold is fixed at $0.5$; the dynamically binarised variant used in some of the literature
+is harder, and numbers should not be compared across the two protocols. Finally, all models
+are unconditional, so the digit grid of Section~\ref{sec:digits} is a selection rather than a
+demonstration of conditional control.
+
+%----------------------------------------------------------------------------------------
+\section{Conclusion}
+%----------------------------------------------------------------------------------------
+
+The three required generators were implemented, trained and evaluated with the metric that
+each formulation supports. On $28\times28$ binarised digits the linear fully visible model
+reaches $0.1393$ bits per pixel and the masked autoregressive model $0.1260$; mixing three
+independently seeded members lowers this to $0.1223$ at three times the parameter count. On
+the original grayscale digits the convolutional generator reaches a feature distance of
+$7.12$, against $34.61$ for the fully connected initial run, with ten classes covered and no
+blank samples. The accompanying repository contains all checkpoints, per-run configurations,
+training histories, the scripts that reproduce every table and figure, and a single command
+that reruns the pipeline on a Windows machine with a CUDA GPU.
+
+\newpage
+\appendix
+
+%----------------------------------------------------------------------------------------
+\section{Run instructions}
+%----------------------------------------------------------------------------------------
+
+The repository is self-contained: MNIST is read from the bundled \texttt{data/} folder, and no
+network access is needed. On Windows with the prepared virtual environment:
+
+\begin{verbatim}
+$py = 'D:\HKStudy\.venv\Scripts\python.exe'
+& $py -m cs5494.checks units
+& $py -m cs5494.train --models fvsbn made --samples 60000 --test-samples 10000 `
+      --side 28 --hidden 1536 --layers 1 --epochs 400 --batch 1024 --lr 0.001 `
+      --scheduler cosine --device cuda --workers 4 --seed 42 `
+      --output results/autoregressive
+& $py -m cs5494.train --models gan --samples 60000 --epochs 400 --batch 512 `
+      --lr 0.0002 --lr-d 0.00002 --arch dcgan --scheduler cosine --ema 0.999 `
+      --device cuda --workers 4 --output results/gan_ema
+& $py -m cs5494.evaluate mixture --runs results/made_seed42 `
+      results/made_seed43 results/made_seed44
+& $py -m cs5494.evaluate gan --runs results/gan_ema --weights ema
+& $py -m cs5494.figures digits
+& $py -m cs5494.checks report
+cd report; powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1
+\end{verbatim}
+
+The same commands work on Colab after installing \texttt{requirements.txt} and replacing
+the interpreter with \texttt{python}; \texttt{assignment.ipynb} wraps them in a notebook.
+The script \texttt{run\_windows.ps1} runs the whole pipeline, including the checks and
+the comparison document. Every script comments the non-obvious parts, and each run writes a
+\texttt{config.json} that records the exact arguments, so any table entry can be traced back
+to the command that produced it.
+
+%----------------------------------------------------------------------------------------
+\section{Code map and additional figures}
+%----------------------------------------------------------------------------------------
+
+\begin{table}[H]
+\centering
+\caption{Files in the shared folder.}
+\small
+\begin{tabular}{ll}
+\toprule
+File & Responsibility \\
+\midrule
+\texttt{cs5494/train.py} & models (FVSBN, MADE, MLP/DCGAN), training loop, previews, metrics \\
+\texttt{cs5494/sample.py} & resample from a checkpoint, optionally the moving-average weights \\
+\texttt{cs5494/evaluate.py} & classifier scores for GANs, mixture likelihood for MADE \\
+\texttt{cs5494/figures.py} & per-digit grids and the MLP training-regime figure \\
+\texttt{cs5494/checks.py} & unit tests, NLL re-computation, report/JSON consistency, hashes \\
+\texttt{cs5494/compare\_runs.py} & side-by-side comparison of result folders \\
+\texttt{report/source\_code\_appendix.tex} & verbatim source of all eight modules (Appendix~C) \\
+\texttt{report/} & this document, \texttt{main.tex} + \texttt{refs.bib} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.62\linewidth]{figures/mlp_variants.png}
+\caption{Fully connected generator under three training regimes. The first uses a
+shared learning rate, the second keeps that rate at a larger batch, and the third applies the
+two-timescale rule. Feature distances are $34.61$, $38.30$ and $7.71$ respectively.}
+\label{fig:mlp-variants}
+\end{figure}
+
+\input{source_code_appendix}
+
+\printbibliography
+
+\end{document}

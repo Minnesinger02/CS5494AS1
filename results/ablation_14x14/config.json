@@ -1,0 +1,18 @@
+{
+  "models": [
+    "fvsbn",
+    "made"
+  ],
+  "data": "data",
+  "output": "outputs/autoregressive",
+  "samples": 60000,
+  "test_samples": 10000,
+  "epochs": 40,
+  "batch": 128,
+  "side": 14,
+  "hidden": 512,
+  "lr": 0.001,
+  "seed": 42,
+  "device": "cpu",
+  "resolved_device": "cpu"
+}

@@ -1,0 +1,27 @@
+{
+  "models": [
+    "made"
+  ],
+  "data": "data",
+  "output": "outputs_v2/made10k_seed44",
+  "samples": 10000,
+  "test_samples": 10000,
+  "epochs": 400,
+  "batch": 1024,
+  "side": 28,
+  "hidden": 1536,
+  "layers": 1,
+  "dropout": 0.0,
+  "weight_decay": 0.0,
+  "val": 0,
+  "arch": "mlp",
+  "scheduler": "cosine",
+  "lr": 0.001,
+  "seed": 44,
+  "device": "cuda",
+  "lr_d": 0.0,
+  "workers": 4,
+  "tf32": 1,
+  "resolved_device": "cuda",
+  "device_name": "NVIDIA GeForce RTX 5080"
+}
