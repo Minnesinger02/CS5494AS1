@@ -123,3 +123,16 @@ package.ps1        rebuild the submission zip
   differences below about one unit are within evaluation noise.
 - `results/*/config.json` records the command-line arguments used at the time; folders may have
   been moved afterwards.
+
+## Google Colab
+
+Open https://colab.research.google.com/github/Minnesinger02/CS5494AS1/blob/main/assignment.ipynb .
+The first code cell clones the repository into /content/CS5494AS1, changes to that
+directory and installs requirements.txt. Choose a GPU runtime for full retraining.
+Running all cells trains the main models again and can take substantial time.
+Local training is valid; Colab retraining is not needed to submit the saved results.
+For quick verification from saved weights, after the setup cell run:
+    !python -m cs5494.checks units
+    !python -m cs5494.sample results/gan_ema gan --which ema
+For a clean local checkout, install requirements.txt before running commands.
+

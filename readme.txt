@@ -102,9 +102,16 @@ Single runs, for reference:
 --------------------------------------------------------------------------------
 5. GOOGLE COLAB
 --------------------------------------------------------------------------------
-Clone the repository, open assignment.ipynb and run the cells top to bottom; the
-notebook calls the same modules with --device auto. On a CPU-only Colab runtime the
-autoregressive models still finish, but expect roughly 7x the times in the report.
+Open https://colab.research.google.com/github/Minnesinger02/CS5494AS1/blob/main/assignment.ipynb .
+The first code cell clones the repository into /content/CS5494AS1, changes to that
+directory and installs requirements.txt. Choose a GPU runtime for full retraining.
+Running all cells trains the main models again and can take substantial time.
+Local training is valid; Colab retraining is not needed to submit the saved results.
+For quick verification from saved weights, after the setup cell run:
+    !python -m cs5494.checks units
+    !python -m cs5494.sample results/gan_ema gan --which ema
+For a clean local checkout, install requirements.txt before running commands.
+
 
 --------------------------------------------------------------------------------
 6. WHERE THE NUMBERS COME FROM
